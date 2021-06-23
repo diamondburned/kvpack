@@ -26,27 +26,85 @@ func initByteOrder() struct{} {
 	return struct{}{}
 }
 
-// Reflected built-in types.
-var (
-	Bool       = reflect.TypeOf(false)
-	Byte       = reflect.TypeOf(byte(0))
-	Uint       = reflect.TypeOf(uint(0))
-	Uint8      = reflect.TypeOf(uint8(0))
-	Uint16     = reflect.TypeOf(uint16(0))
-	Uint32     = reflect.TypeOf(uint32(0))
-	Uint64     = reflect.TypeOf(uint64(0))
-	Int        = reflect.TypeOf(int(0))
-	Int8       = reflect.TypeOf(int8(0))
-	Int16      = reflect.TypeOf(int16(0))
-	Int32      = reflect.TypeOf(int32(0))
-	Int64      = reflect.TypeOf(int64(0))
-	Float32    = reflect.TypeOf(float32(0))
-	Float64    = reflect.TypeOf(float64(0))
-	Complex64  = reflect.TypeOf(complex64(0))
-	Complex128 = reflect.TypeOf(complex128(0))
-	String     = reflect.TypeOf("")
-	ByteSlice  = reflect.TypeOf([]byte(nil))
-)
+// ByteSlice is the reflect.Type value for a byte slice.
+var ByteSlice = reflect.TypeOf([]byte(nil))
+
+var intBufferPool = sync.Pool{
+	New: func() interface{} { return make([]byte, 10) },
+}
+
+// BorrowedBytes is a type that wraps around a byte slice to allow the caller to
+// borrow it. The caller MUST return those borrowed values using the Return
+// method.
+type BorrowedBytes struct {
+	Bytes []byte
+	taken bool // true if pooled
+}
+
+// Return returns the borrowed bytes back to the internal pool.
+func (b *BorrowedBytes) Return() {
+	if b.taken {
+		// Reset the length of the buffer and put it back.
+		buf := b.Bytes[:10]
+		intBufferPool.Put(buf)
+		// Take the returned buffer away from the caller.
+		b.Bytes = nil
+	}
+}
+
+// Varint is a helper function that converts an integer into a byte slice to be
+// used as a database key.
+func Varint(i int64) BorrowedBytes {
+	b := intBufferPool.Get().([]byte)
+
+	uvarint := b[:binary.PutVarint(b, i)]
+	return BorrowedBytes{uvarint, true}
+}
+
+// Uvarint is a helper function that converts an unsigned integer into a byte
+// slice to be used as a database key.
+func Uvarint(u uint64) BorrowedBytes {
+	b := intBufferPool.Get().([]byte)
+
+	varint := b[:binary.PutUvarint(b, u)]
+	return BorrowedBytes{varint, true}
+}
+
+// Int64LE is a helper function that converts the given int64 value into bytes,
+// ideally without copying on a little-endian machine. The bytes are always in
+// little-endian.
+func Int64LE(i int64) BorrowedBytes {
+	if IsLittleEndian {
+		return BorrowedBytes{(*[8]byte)(unsafe.Pointer(&i))[:], false}
+	}
+
+	b := intBufferPool.Get().([]byte)
+	binary.LittleEndian.PutUint64(b, uint64(i))
+	return BorrowedBytes{b[:8], true}
+}
+
+// Uint64LE is a helper function that converts the given uint64 value into
+// bytes, ideally without copying on a little-endian machine. The bytes are
+// always in little-endian.
+func Uint64LE(i uint64) BorrowedBytes {
+	if IsLittleEndian {
+		return BorrowedBytes{(*[8]byte)(unsafe.Pointer(&i))[:], false}
+	}
+
+	b := intBufferPool.Get().([]byte)
+	binary.LittleEndian.PutUint64(b, uint64(i))
+	return BorrowedBytes{b[:8], true}
+}
+
+// WriteInt64LE writes the given int64 into the given byte slice.
+func WriteInt64LE(dst []byte, i int64) {
+	if IsLittleEndian {
+		// Budget SIMD lol.
+		*(*int64)(unsafe.Pointer(&dst[0])) = i
+	} else {
+		binary.LittleEndian.PutUint64(dst, uint64(i))
+	}
+}
 
 // NumberLE returns the little-endian variant of the given number at the
 // pointer. It does not handle variable-length integers, and is meant only for
@@ -54,67 +112,84 @@ var (
 //
 // If this method is called on a Big Endian macnine, then a new byte buffer will
 // be allocated from the pool.
-func NumberLE(typ reflect.Type, ptr unsafe.Pointer, f func([]byte) error) error {
+func NumberLE(kind reflect.Kind, ptr unsafe.Pointer) BorrowedBytes {
 	if !IsLittleEndian {
-		return numberAsLE(typ, ptr, f)
+		return numberAsLE(kind, ptr)
 	}
 
-	switch typ {
-	case Uint8, Int8, Byte:
-		return f((*[1]byte)(ptr)[:])
-	case Uint16, Int16:
-		return f((*[2]byte)(ptr)[:])
-	case Uint32, Int32, Float32:
-		return f((*[4]byte)(ptr)[:])
-	case Uint64, Int64, Float64, Complex64:
-		return f((*[8]byte)(ptr)[:])
-	case Complex128:
-		return f((*[16]byte)(ptr)[:])
+	switch kind {
+	case reflect.Uint8, reflect.Int8:
+		return BorrowedBytes{(*[1]byte)(ptr)[:], false}
+	case reflect.Uint16, reflect.Int16:
+		return BorrowedBytes{(*[2]byte)(ptr)[:], false}
+	case reflect.Uint32, reflect.Int32, reflect.Float32:
+		return BorrowedBytes{(*[4]byte)(ptr)[:], false}
+	case reflect.Uint64, reflect.Int64, reflect.Float64, reflect.Complex64:
+		return BorrowedBytes{(*[8]byte)(ptr)[:], false}
+	case reflect.Complex128:
+		return BorrowedBytes{(*[16]byte)(ptr)[:], false}
 	default:
-		panic("NumberLE got unsupported type " + typ.String())
+		panic("NumberLE got unsupported kind " + kind.String())
 	}
-}
-
-var bigEndianPool = sync.Pool{
-	New: func() interface{} { return make([]byte, 8) },
 }
 
 // numberAsLE is the slow path. It tries not to allocate by having an internal
 // byte buffer pool.
-func numberAsLE(typ reflect.Type, ptr unsafe.Pointer, f func([]byte) error) error {
-	switch typ {
-	case Uint8, Int8, Byte:
+func numberAsLE(kind reflect.Kind, ptr unsafe.Pointer) BorrowedBytes {
+	switch kind {
+	case reflect.Uint8, reflect.Int8:
 		// A single byte is architecture-independent.
-		return f((*[1]byte)(ptr)[:])
+		return BorrowedBytes{(*[1]byte)(ptr)[:], false}
 	}
 
-	b := bigEndianPool.Get().([]byte)
-	defer bigEndianPool.Put(b)
+	b := intBufferPool.Get().([]byte)
+	defer intBufferPool.Put(b)
 
-	switch typ {
-	case Uint16, Int16:
+	switch kind {
+	case reflect.Uint16, reflect.Int16:
 		binary.LittleEndian.PutUint16(b, *(*uint16)(ptr))
-		return f(b[:2])
-	case Uint32, Int32, Float32:
+		return BorrowedBytes{b[:2], true}
+	case reflect.Uint32, reflect.Int32, reflect.Float32:
 		binary.LittleEndian.PutUint32(b, *(*uint32)(ptr))
-		return f(b[:4])
-	case Uint64, Int64, Float64, Complex64:
+		return BorrowedBytes{b[:4], true}
+	case reflect.Uint64, reflect.Int64, reflect.Float64, reflect.Complex64:
 		binary.LittleEndian.PutUint64(b, *(*uint64)(ptr))
-		return f(b[:8])
-	case Complex128:
+		return BorrowedBytes{b[:8], true}
+	case reflect.Complex128:
 		panic("Complex128 unsupported on Big Endian (TODO)")
 	default:
-		panic("numberAsLE got unsupported type " + typ.String())
+		panic("numberAsLE got unsupported kind " + kind.String())
 	}
 }
 
-// IsZero returns true if the value that the pointer points to is nil.
-func IsZero(typ reflect.Type, ptr unsafe.Pointer) bool {
-	return reflect.NewAt(typ, ptr).Elem().IsZero()
+// zeroes might just be one of my worst hacks to date.
+var zeroes [102400]byte // 10KB
+
+// IsZero returns true if the value that the pointer points to is nil. For
+// benchmarks, see defract_bench_test.go
+func IsZero(ptr unsafe.Pointer, size uintptr) bool {
+	rawValue := unsafe.Slice((*byte)(ptr), size)
+
+	if size < 102400 {
+		// Fast path that utilizes Go's intrinsics for comparison.
+		return string(zeroes[:size]) == string(rawValue)
+	}
+
+	return isZeroAny(rawValue)
+}
+
+func isZeroAny(bytes []byte) bool {
+	for _, b := range bytes {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 var (
-	structCache  sync.Map // unsafe.Pointer -> *structInfo
+	structCache  = map[unsafe.Pointer]*StructInfo{} // unsafe.Pointer -> *structInfo
+	structMutex  sync.RWMutex
 	structFlight singleflight.Group
 )
 
@@ -125,6 +200,7 @@ type StructInfo struct {
 type StructField struct {
 	Name   []byte
 	Type   reflect.Type
+	Size   uintptr
 	Offset uintptr
 }
 
@@ -135,10 +211,18 @@ func GetStructInfo(typ reflect.Type) *StructInfo {
 	// the value pointer. The type pointer is most likely *rtype, but we don't
 	// care about that. Instead, we care about the pointer value of that type,
 	// which is the value pointer. This allows us to access the map faster.
+	type iface struct {
+		_ uintptr
+		p unsafe.Pointer
+	}
 
-	v, ok := structCache.Load(typ)
+	ptr := (*iface)(unsafe.Pointer(&typ)).p
+
+	structMutex.RLock()
+	v, ok := structCache[ptr]
+	structMutex.RUnlock()
 	if ok {
-		return v.(*StructInfo)
+		return v
 	}
 
 	var typeName string
@@ -153,15 +237,17 @@ func GetStructInfo(typ reflect.Type) *StructInfo {
 		typeName = pkgPath + "." + typ.Name()
 	}
 
-	v, _, _ = structFlight.Do(typeName, func() (interface{}, error) {
+	ret, _, _ := structFlight.Do(typeName, func() (interface{}, error) {
 		var info StructInfo
 		info.get(typ)
 
-		structCache.Store(typ, &info)
+		structMutex.Lock()
+		structCache[ptr] = &info
+		structMutex.Unlock()
 		return &info, nil
 	})
 
-	return v.(*StructInfo)
+	return ret.(*StructInfo)
 }
 
 func (info *StructInfo) get(typ reflect.Type) {
@@ -178,6 +264,7 @@ func (info *StructInfo) get(typ reflect.Type) {
 		info.Fields = append(info.Fields, StructField{
 			Name:   []byte(fieldType.Name),
 			Type:   fieldType.Type,
+			Size:   fieldType.Type.Size(),
 			Offset: fieldType.Offset,
 		})
 	}
@@ -231,4 +318,11 @@ func Indirect(typ reflect.Type, ptr unsafe.Pointer) (reflect.Type, unsafe.Pointe
 		typ = typ.Elem()
 	}
 	return typ, ptr
+}
+
+// SliceInfo returns the backing array pointer and length of the slice at the
+// given pointer.
+func SliceInfo(ptr unsafe.Pointer) (unsafe.Pointer, int) {
+	return unsafe.Pointer((*reflect.SliceHeader)(ptr).Data),
+		(*reflect.SliceHeader)(ptr).Len
 }

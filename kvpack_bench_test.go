@@ -19,18 +19,27 @@ func (tx noopTx) Get(k []byte, fn func([]byte) error) error {
 	return fn(nil)
 }
 
+func (tx noopTx) Iterate(prefix []byte, fn func(k, v []byte) error) error {
+	return nil
+}
+
 func (tx noopTx) DeletePrefix(prefix []byte) error {
 	return nil
 }
 
 type benchmarkStruct struct {
-	BestCharacter  string
-	CharacterScore string
+	BestCharacter   string
+	CharacterScore  int32
+	OtherCharacters []benchmarkStruct
 }
 
 var benchmarkValue = benchmarkStruct{
 	BestCharacter:  "Astolfo",
-	CharacterScore: "100",
+	CharacterScore: 100,
+	OtherCharacters: []benchmarkStruct{
+		{"Felix Argyle", 100, nil},
+		{"Hime Arikawa", 100, nil},
+	},
 }
 
 func BenchmarkTransactionPutStruct(b *testing.B) {
@@ -53,7 +62,7 @@ func BenchmarkTransactionPutJSON(b *testing.B) {
 	k := []byte("best_character")
 	v := benchmarkValue
 
-	tx := newTestTx(noopTx{}, "kvpack_test")
+	db := noopTx{}
 
 	var buf bytes.Buffer
 
@@ -67,7 +76,7 @@ func BenchmarkTransactionPutJSON(b *testing.B) {
 			b.Fatal("failed to encode:", err)
 		}
 
-		if err := tx.Put(k, &v); err != nil {
+		if err := db.Put(k, buf.Bytes()); err != nil {
 			b.Fatal("failed to put:", err)
 		}
 	}
