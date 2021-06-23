@@ -20,4 +20,6 @@ type Transaction interface {
 	// Put puts the given value into the given key. It must not keep any of the
 	// given byte slices after the call.
 	Put(k, v []byte) error
+	// DeletePrefix wipes a key with the given prefix.
+	DeletePrefix(prefix []byte) error
 }

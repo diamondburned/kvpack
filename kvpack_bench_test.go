@@ -19,6 +19,10 @@ func (tx noopTx) Get(k []byte, fn func([]byte) error) error {
 	return fn(nil)
 }
 
+func (tx noopTx) DeletePrefix(prefix []byte) error {
+	return nil
+}
+
 type benchmarkStruct struct {
 	BestCharacter  string
 	CharacterScore string
