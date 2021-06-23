@@ -194,14 +194,22 @@ var (
 )
 
 type StructInfo struct {
+	Type   reflect.Type
 	Fields []StructField
 }
 
 type StructField struct {
 	Name   []byte
 	Type   reflect.Type
+	Kind   reflect.Kind
 	Size   uintptr
 	Offset uintptr
+
+	// ChildStruct is provided if this field is of type struct. If the type
+	// matches exactly the parent, then the same pointer is set.
+	ChildStruct *StructInfo
+	// Indirect is true if the type is pointer.
+	Indirect bool
 }
 
 // GetStructInfo returns the struct type information for the given struct value.
@@ -211,12 +219,7 @@ func GetStructInfo(typ reflect.Type) *StructInfo {
 	// the value pointer. The type pointer is most likely *rtype, but we don't
 	// care about that. Instead, we care about the pointer value of that type,
 	// which is the value pointer. This allows us to access the map faster.
-	type iface struct {
-		_ uintptr
-		p unsafe.Pointer
-	}
-
-	ptr := (*iface)(unsafe.Pointer(&typ)).p
+	ptr := InterfacePtr(typ)
 
 	structMutex.RLock()
 	v, ok := structCache[ptr]
@@ -239,6 +242,7 @@ func GetStructInfo(typ reflect.Type) *StructInfo {
 
 	ret, _, _ := structFlight.Do(typeName, func() (interface{}, error) {
 		var info StructInfo
+		info.Type = typ
 		info.get(typ)
 
 		structMutex.Lock()
@@ -262,23 +266,50 @@ func (info *StructInfo) get(typ reflect.Type) {
 		}
 
 		info.Fields = append(info.Fields, StructField{
-			Name:   []byte(fieldType.Name),
-			Type:   fieldType.Type,
-			Size:   fieldType.Type.Size(),
-			Offset: fieldType.Offset,
+			Name:     []byte(fieldType.Name),
+			Type:     fieldType.Type,
+			Kind:     fieldType.Type.Kind(),
+			Size:     fieldType.Type.Size(),
+			Offset:   fieldType.Offset,
+			Indirect: fieldType.Type.Kind() == reflect.Ptr,
 		})
+
+		// Access the struct field that we just put in.
+		structField := &info.Fields[len(info.Fields)-1]
+
+		underlyingType := fieldType.Type
+		if structField.Indirect {
+			underlyingType = underlyingType.Elem()
+		}
+
+		if underlyingType.Kind() == reflect.Struct {
+			if underlyingType == typ {
+				// Struct field's type is the same as the one we're
+				// initializing, so use that same pointer.
+				structField.ChildStruct = info
+			} else {
+				// Prefetch the struct information if this one embeds it.
+				structField.ChildStruct = GetStructInfo(underlyingType)
+			}
+		}
 	}
+}
+
+type _iface struct {
+	_ uintptr
+	p unsafe.Pointer
+}
+
+// InterfacePtr returns the pointer to the internal value of the given
+// interface.
+func InterfacePtr(v interface{}) unsafe.Pointer {
+	return (*_iface)(unsafe.Pointer(&v)).p
 }
 
 // UnderlyingPtr returns the type of and the pointer to the value of the
 // interface by dereferencing it until the actual value is reached.
 func UnderlyingPtr(v interface{}) (reflect.Type, unsafe.Pointer) {
-	type iface struct {
-		_ uintptr
-		p unsafe.Pointer
-	}
-
-	ptr := (*iface)(unsafe.Pointer(&v)).p
+	ptr := InterfacePtr(v)
 	if ptr == nil {
 		return nil, nil
 	}
@@ -318,6 +349,14 @@ func Indirect(typ reflect.Type, ptr unsafe.Pointer) (reflect.Type, unsafe.Pointe
 		typ = typ.Elem()
 	}
 	return typ, ptr
+}
+
+// IndirectOnce dereferences ptr once. It returns nil if ptr is nil.
+func IndirectOnce(ptr unsafe.Pointer) unsafe.Pointer {
+	if ptr == nil {
+		return nil
+	}
+	return *(*unsafe.Pointer)(ptr)
 }
 
 // SliceInfo returns the backing array pointer and length of the slice at the

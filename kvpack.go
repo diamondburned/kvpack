@@ -114,18 +114,22 @@ func (tx *Transaction) Put(k []byte, v interface{}) error {
 		return nil
 	}
 
-	return tx.putValue(key, typ, ptr, 0)
+	return tx.putValue(key, typ, typ.Kind(), ptr, 0)
 }
 
-func (tx *Transaction) putValue(k []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
+func (tx *Transaction) putValue(
+	k []byte, typ reflect.Type, kind reflect.Kind, ptr unsafe.Pointer, rec int) error {
+
 	if rec > recursionLimit {
 		return ErrTooRecursed
 	}
 
-	typ, ptr = defract.Indirect(typ, ptr)
-	if ptr == nil {
-		// Do nothing with a nil pointer.
-		return nil
+	if kind == reflect.Ptr {
+		typ, ptr = defract.Indirect(typ, ptr)
+		if ptr == nil {
+			// Do nothing with a nil pointer.
+			return nil
+		}
 	}
 
 	// Comparing Kind is a lot faster.
@@ -175,7 +179,7 @@ func (tx *Transaction) putValue(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 		panic("TODO: array")
 
 	case reflect.Struct:
-		return tx.putStruct(k, typ, ptr, rec+1)
+		return tx.putStruct(k, defract.GetStructInfo(typ), ptr, rec+1)
 
 	case reflect.Map:
 		return tx.putMap(k, typ, ptr, rec+1)
@@ -202,6 +206,7 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 
 	// slice of <this> type
 	underlying := typ.Elem()
+	valueKind := underlying.Kind()
 	valueSize := underlying.Size()
 
 	// Keeping this as int64 is possibly slower on 32-bit architecture machines,
@@ -228,7 +233,7 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 		// Slice key to include the extra slice.
 		key = key[:len(key)+8]
 
-		if err := tx.putValue(key, underlying, dataPtr, rec); err != nil {
+		if err := tx.putValue(key, underlying, valueKind, dataPtr, rec); err != nil {
 			return errors.Wrapf(err, "index %d", i)
 		}
 
@@ -239,12 +244,14 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 	return nil
 }
 
-func (tx *Transaction) putStruct(k []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
+func (tx *Transaction) putStruct(
+	k []byte, info *defract.StructInfo, ptr unsafe.Pointer, rec int) error {
+
 	if rec > recursionLimit {
 		return ErrTooRecursed
 	}
 
-	info := defract.GetStructInfo(typ)
+	var err error
 
 	for _, field := range info.Fields {
 		ptr := unsafe.Add(ptr, field.Offset)
@@ -255,15 +262,29 @@ func (tx *Transaction) putStruct(k []byte, typ reflect.Type, ptr unsafe.Pointer,
 
 		key := tx.kb.append(k, field.Name)
 
-		if err := tx.putValue(key, field.Type, ptr, rec+1); err != nil {
-			return errors.Wrapf(err, "struct %s field %s", typ, field.Name)
+		if field.ChildStruct != nil {
+			if field.Indirect {
+				ptr = defract.IndirectOnce(ptr)
+			}
+			// Field is a struct, use the fast path and skip the map lookup.
+			err = tx.putStruct(key, field.ChildStruct, ptr, rec+1)
+		} else {
+			err = tx.putValue(key, field.Type, field.Kind, ptr, rec+1)
+		}
+
+		if err != nil {
+			return errors.Wrapf(err, "struct %s field %s", info.Type, field.Name)
 		}
 	}
 
 	return nil
 }
 
-func (tx *Transaction) putMap(k []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
+// putMap is slow and allocates. The zero-allocation guarantee does not apply
+// for it, because it is too bothersome to be dealt with. Just don't use maps.
+func (tx *Transaction) putMap(
+	k []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
+
 	if rec > recursionLimit {
 		return ErrTooRecursed
 	}
@@ -273,61 +294,69 @@ func (tx *Transaction) putMap(k []byte, typ reflect.Type, ptr unsafe.Pointer, re
 
 	keyType := typ.Key()
 	valueType := typ.Elem()
+	valueKind := valueType.Kind()
 
 	switch kind := keyType.Kind(); kind {
-	case reflect.Float32, reflect.Float64:
-		keyer = func(v reflect.Value) []byte {
-			b := defract.Uint64LE(math.Float64bits(v.Float()))
-			k := tx.kb.append(k, b.Bytes)
-			b.Return()
+	case reflect.Float32, reflect.Float64,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 
+		key := func(borrowed defract.BorrowedBytes) []byte {
+			k := tx.kb.append(k, borrowed.Bytes)
+			borrowed.Return()
 			return k
 		}
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		keyer = func(v reflect.Value) []byte {
-			b := defract.Int64LE(v.Int())
-			k := tx.kb.append(k, b.Bytes)
-			b.Return()
 
-			return k
-		}
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		keyer = func(v reflect.Value) []byte {
-			b := defract.Uint64LE(v.Uint())
-			k := tx.kb.append(k, b.Bytes)
-			b.Return()
-
-			return k
+		switch kind {
+		case reflect.Float32, reflect.Float64:
+			keyer = func(v reflect.Value) []byte {
+				return key(defract.Uint64LE(math.Float64bits(v.Float())))
+			}
+		case reflect.Int:
+			keyer = func(v reflect.Value) []byte {
+				return key(defract.Varint(v.Int()))
+			}
+		case reflect.Uint:
+			keyer = func(v reflect.Value) []byte {
+				return key(defract.Uvarint(v.Uint()))
+			}
+		case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			keyer = func(v reflect.Value) []byte {
+				return key(defract.Int64LE(v.Int()))
+			}
+		case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			keyer = func(v reflect.Value) []byte {
+				return key(defract.Uint64LE(v.Uint()))
+			}
 		}
 	case reflect.String:
 		keyer = func(v reflect.Value) []byte {
 			// Like putBytes, this is safe as long as we don't access the
-			// capacity.
-			strPtr := *(*[]byte)(unsafe.Pointer(v.UnsafeAddr()))
-			return tx.kb.append(k, strPtr)
+			// capacity. Not to mention, mapIter.Value() does a copy.
+			str := v.Interface().(string)
+			return tx.kb.append(k, *(*[]byte)(unsafe.Pointer(&str)))
 		}
 	default:
-		return fmt.Errorf("unknown type %s", keyType)
+		return fmt.Errorf("unsupported key type %s", keyType)
 	}
 
 	// There's really no choice but to handle maps the slow way.
 	mapIter := reflect.NewAt(typ, ptr).Elem().MapRange()
 	for mapIter.Next() {
-		key := keyer(mapIter.Key())
+		mapKey := mapIter.Key()
+		mapValue := mapIter.Value()
 
-		if err := tx.putMapValue(key, valueType, mapIter.Value(), rec+1); err != nil {
-			return errors.Wrapf(err, "map %s key %q", typ, mapIter.Key())
+		key := keyer(mapKey)
+		// Do a small hack to get the pointer to the map value without using
+		// UnsafeAddr, as that would panic.
+		ptr := defract.InterfacePtr(mapValue.Interface())
+
+		if err := tx.putValue(key, valueType, valueKind, ptr, rec+1); err != nil {
+			return errors.Wrapf(err, "map %s key %q", typ, mapValue)
 		}
 	}
 
 	return nil
-}
-
-func (tx *Transaction) putMapValue(k []byte, typ reflect.Type, val reflect.Value, rec int) error {
-	if rec > recursionLimit {
-		return ErrTooRecursed
-	}
-	panic("TODO")
 }
 
 // manualIterator returns a non-nil ManualIterator if the transaction supports
