@@ -2,6 +2,7 @@ package kvpack
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"reflect"
 	"sync"
@@ -170,10 +171,10 @@ func (tx *Transaction) putValue(
 		return tx.putBytes(k, ptr)
 
 	case reflect.Slice:
-		if typ == defract.ByteSlice {
-			return tx.putBytes(k, ptr)
+		if typ != defract.ByteSlice {
+			return tx.putSlice(k, typ, ptr, rec+1)
 		}
-		return tx.putSlice(k, typ, ptr, rec+1)
+		return tx.putBytes(k, ptr)
 
 	case reflect.Array:
 		panic("TODO: array")
@@ -415,7 +416,129 @@ func (tx *Transaction) get(k []byte, v interface{}) error {
 		})
 	}
 
-	panic("unimplemented")
+	typ := reflect.TypeOf(v)
+	kind := typ.Kind()
+
+	if kind != reflect.Ptr {
+		return errors.New("given v is not pointer")
+	}
+
+	ptr := defract.InterfacePtr(v)
+	return tx.getValue(k, typ, kind, ptr, 0)
+}
+
+func (tx *Transaction) getValue(
+	k []byte, typ reflect.Type, kind reflect.Kind, ptr unsafe.Pointer, rec int) error {
+
+	if rec > recursionLimit {
+		return ErrTooRecursed
+	}
+
+	if kind == reflect.Ptr {
+		typ, ptr = defract.AllocIndirect(typ, ptr)
+		if ptr == nil {
+			// Do nothing with a nil pointer.
+			return nil
+		}
+	}
+
+	// Comparing Kind is a lot faster.
+	switch kind := typ.Kind(); kind {
+	// Handle uint and int like variable-length integers. These helper functions
+	// pool the backing array, so this should be decently fast.
+	case reflect.Uint, reflect.Int:
+		return tx.tx.Get(k, func(b []byte) error {
+			if !defract.ReadVarInt(b, kind, ptr) {
+				return errors.New("(u)varint overflow")
+			}
+			return nil
+		})
+
+	case reflect.Bool:
+		// A bool can probably be treated as 1 byte, so we can check the first
+		// byte if it's 0 or 1.
+		return tx.tx.Get(k, func(b []byte) error {
+			*(*bool)(ptr) = b[0] != 0
+			return nil
+		})
+
+	case
+		reflect.Float32, reflect.Float64,
+		reflect.Complex64, reflect.Complex128,
+		reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+
+		return tx.tx.Get(k, func(b []byte) error {
+			if !defract.ReadNumberLE(b, kind, ptr) {
+				return io.ErrUnexpectedEOF
+			}
+			return nil
+		})
+
+	case reflect.String:
+		return tx.tx.Get(k, func(b []byte) error {
+			*(*string)(ptr) = string(b) // copies
+			return nil
+		})
+
+	case reflect.Slice:
+		if typ != defract.ByteSlice {
+			return tx.getSlice(k, typ, ptr, rec+1)
+		}
+
+		return tx.tx.Get(k, func(b []byte) error {
+			dst := (*[]byte)(ptr)
+			// If the existing slice has enough capacity, then we can
+			// directly copy over.
+			if cap(*dst) >= len(b) {
+				*dst = (*dst)[:len(b)]
+			} else {
+				// Else, allocate a new one.
+				*dst = make([]byte, len(b))
+			}
+			copy(*dst, b)
+			return nil
+		})
+
+	case reflect.Array:
+		panic("TODO: array")
+
+	case reflect.Struct:
+		return tx.putStruct(k, defract.GetStructInfo(typ), ptr, rec+1)
+
+	case reflect.Map:
+		return tx.putMap(k, typ, ptr, rec+1)
+	}
+
+	return fmt.Errorf("unknown type %s", typ)
+}
+
+func (tx *Transaction) getSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
+	panic("TODO")
+}
+
+func (tx *Transaction) getStruct(
+	k []byte, info *defract.StructInfo, ptr unsafe.Pointer, rec int) error {
+
+	var length int64
+	if err := tx.tx.Get(tx.kb.append(k, []byte("l")), func(b []byte) error {
+		var ok bool
+		length, ok = defract.ReadInt64LE(b)
+		if !ok {
+			return io.ErrUnexpectedEOF
+		}
+		return nil
+	}); err != nil {
+		return errors.Wrap(err, "failed to read slice len")
+	}
+
+	panic("TODO")
+}
+
+func (tx *Transaction) getMap(
+	k []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
+
+	panic("TODO")
 }
 
 // reusableKey describes a buffer where keys are appended into a single,

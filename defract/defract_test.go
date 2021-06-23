@@ -81,3 +81,22 @@ func TestUnderlyingPtr(t *testing.T) {
 		check(t, &ptr, mockType(""))
 	})
 }
+
+func TestIsZero(t *testing.T) {
+	testWithSize := func(t *testing.T, size, offset int) {
+		value := make([]byte, size)
+		if !IsZero(unsafe.Pointer(&value[0]), uintptr(len(value))) {
+			t.Error("value is not eq when it should be")
+		}
+
+		value[size-offset] = '\x01'
+		if IsZero(unsafe.Pointer(&value[0]), uintptr(len(value))) {
+			t.Error("value is eq when it should not be")
+		}
+	}
+
+	t.Run("1024", func(t *testing.T) { testWithSize(t, 1024, 1) })
+	t.Run("4096", func(t *testing.T) { testWithSize(t, 4096, 1) })
+	t.Run("1024000_1", func(t *testing.T) { testWithSize(t, 1024000, 1) })
+	t.Run("1024000_2", func(t *testing.T) { testWithSize(t, 1024000, 1024000/4) })
+}

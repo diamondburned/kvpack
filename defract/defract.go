@@ -70,6 +70,30 @@ func Uvarint(u uint64) BorrowedBytes {
 	return BorrowedBytes{varint, true}
 }
 
+// ReadVarInt reads a variable-length signed or unsigned integer into the given
+// pointer. False is returned if the number inside the bytes overflow int or
+// uint.
+func ReadVarInt(b []byte, k reflect.Kind, p unsafe.Pointer) bool {
+	switch k {
+	case reflect.Int:
+		v, sz := binary.Varint(b)
+		if sz > 0 {
+			*(*int)(p) = int(v)
+			return true
+		}
+	case reflect.Uint:
+		v, sz := binary.Uvarint(b)
+		if sz > 0 {
+			*(*int)(p) = int(v)
+			return true
+		}
+	default:
+		panic("ReadVarInt got unknown kind " + k.String())
+	}
+
+	return false
+}
+
 // Int64LE is a helper function that converts the given int64 value into bytes,
 // ideally without copying on a little-endian machine. The bytes are always in
 // little-endian.
@@ -103,6 +127,114 @@ func WriteInt64LE(dst []byte, i int64) {
 		*(*int64)(unsafe.Pointer(&dst[0])) = i
 	} else {
 		binary.LittleEndian.PutUint64(dst, uint64(i))
+	}
+}
+
+// ReadInt64LE reads dst and returns an int64 if dst has enough data. Otherwise,
+// false is returned.
+func ReadInt64LE(dst []byte) (int64, bool) {
+	if len(dst) < 8 {
+		return 0, false
+	}
+
+	if IsLittleEndian {
+		return *(*int64)(unsafe.Pointer(&dst[0])), true
+	} else {
+		return int64(binary.LittleEndian.Uint64(dst)), true
+	}
+}
+
+// ReadNumberLE reads the little-endian number of the given byte slice into the
+// pointer. If bound checking fails, false is returned.
+func ReadNumberLE(b []byte, kind reflect.Kind, ptr unsafe.Pointer) bool {
+	if !IsLittleEndian {
+		panic("TODO ReadNumberLE Big Endian")
+	}
+
+	switch kind {
+	case reflect.Uint8, reflect.Int8:
+		if len(b) < 1 {
+			return false
+		}
+
+		*(*uint8)(ptr) = b[0]
+		return true
+
+	case reflect.Uint16, reflect.Int16:
+		if len(b) < 2 {
+			return false
+		}
+
+		// Fast but shitty SIMD copying.
+		*(*uint16)(ptr) = *(*uint16)(unsafe.Pointer(&b[0]))
+		return true
+
+	case reflect.Uint32, reflect.Int32, reflect.Float32:
+		if len(b) < 4 {
+			return false
+		}
+
+		*(*uint32)(ptr) = *(*uint32)(unsafe.Pointer(&b[0]))
+		return true
+
+	case reflect.Uint64, reflect.Int64, reflect.Float64, reflect.Complex64:
+		if len(b) < 8 {
+			return false
+		}
+
+		*(*uint64)(ptr) = *(*uint64)(unsafe.Pointer(&b[0]))
+		return true
+
+	case reflect.Complex128:
+		// Copy returns min(b_len, value_len), so we can do this shorthand.
+		return copy(unsafe.Slice((*byte)(ptr), 16), b) == 16
+
+	default:
+		panic("NumberLE got unsupported kind " + kind.String())
+	}
+}
+
+func readNumberAsLE(b []byte, kind reflect.Kind, ptr unsafe.Pointer) bool {
+	switch kind {
+	case reflect.Uint8, reflect.Int8:
+		if len(b) < 1 {
+			return false
+		}
+
+		// Architecture-independent.
+		*(*uint8)(ptr) = b[0]
+		return true
+	}
+
+	switch kind {
+	case reflect.Uint16, reflect.Int16:
+		if len(b) < 2 {
+			return false
+		}
+
+		*(*uint16)(ptr) = binary.LittleEndian.Uint16(b)
+		return true
+
+	case reflect.Uint32, reflect.Int32, reflect.Float32:
+		if len(b) < 4 {
+			return false
+		}
+
+		*(*uint32)(ptr) = binary.LittleEndian.Uint32(b)
+		return true
+
+	case reflect.Uint64, reflect.Int64, reflect.Float64, reflect.Complex64:
+		if len(b) < 8 {
+			return false
+		}
+
+		*(*uint64)(ptr) = binary.LittleEndian.Uint64(b)
+		return true
+
+	case reflect.Complex128:
+		panic("Complex128 unsupported on Big Endian (TODO)")
+	default:
+		panic("numberAsLE got unsupported kind " + kind.String())
 	}
 }
 
@@ -162,28 +294,73 @@ func numberAsLE(kind reflect.Kind, ptr unsafe.Pointer) BorrowedBytes {
 	}
 }
 
-// zeroes might just be one of my worst hacks to date.
-var zeroes [102400]byte // 10KB
+const zeroesLen = 102400 // 10KB
 
-// IsZero returns true if the value that the pointer points to is nil. For
-// benchmarks, see defract_bench_test.go
+// zeroes might just be one of my worst hacks to date.
+var zeroes [zeroesLen]byte
+
+// ZeroOut fills the given buffer with zeroes.
+func ZeroOut(ptr unsafe.Pointer, size uintptr) {
+	if copy(unsafe.Slice((*byte)(ptr), size), zeroes[:]) < zeroesLen {
+		return
+	}
+
+	// Fill out the rest if copy returns exactly the length of zeroes. We can do
+	// this 8 bytes at a time by using uint64.
+	vec8End := size - (size % 8)
+	current := uintptr(zeroesLen)
+
+	for current < vec8End {
+		*(*uint64)(unsafe.Add(ptr, current)) = 0
+		current += 8
+	}
+
+	for current < size {
+		*(*byte)(unsafe.Add(ptr, current)) = 0
+		current++
+	}
+}
+
+// IsZero returns true if the data at the given pointer is all zero. The
+// function scans the data up to the given length.
 func IsZero(ptr unsafe.Pointer, size uintptr) bool {
 	rawValue := unsafe.Slice((*byte)(ptr), size)
 
-	if size < 102400 {
+	if size < zeroesLen {
 		// Fast path that utilizes Go's intrinsics for comparison.
 		return string(zeroes[:size]) == string(rawValue)
 	}
 
-	return isZeroAny(rawValue)
+	// Compare using the fast path the first zeroesLen bytes anyway.
+	if string(zeroes[:]) != string(rawValue[:zeroesLen]) {
+		return false
+	}
+
+	return isZeroAny(rawValue[zeroesLen:])
 }
 
 func isZeroAny(bytes []byte) bool {
-	for _, b := range bytes {
-		if b != 0 {
+	// vec8End defines the boundary in which the increment-by-8 loop cannot go
+	// further.
+	vec8End := len(bytes) - (len(bytes) % 8)
+	current := 0
+
+	// Compare (hopefully) most of the buffer 8 bytes at a time.
+	for current < vec8End {
+		if *(*uint64)(unsafe.Pointer(&bytes[current])) != 0 {
 			return false
 		}
+		current += 8
 	}
+
+	// Compare the rest using a regular loop.
+	for current < len(bytes) {
+		if bytes[current] != 0 {
+			return false
+		}
+		current++
+	}
+
 	return true
 }
 
@@ -357,6 +534,27 @@ func IndirectOnce(ptr unsafe.Pointer) unsafe.Pointer {
 		return nil
 	}
 	return *(*unsafe.Pointer)(ptr)
+}
+
+// AllocIndirect allocates a pointer type until the value is reached, and the
+// pointer to that newly-allocated value is returned, along with the underlying
+// type. If the given ptr is not nil, then the memory will be reused.
+func AllocIndirect(typ reflect.Type, ptr unsafe.Pointer) (reflect.Type, unsafe.Pointer) {
+	for typ.Kind() == reflect.Ptr {
+		if ptr != nil {
+			ptr = *(*unsafe.Pointer)(ptr)
+		} else {
+			ptr = unsafe.Pointer(reflect.New(typ).UnsafeAddr())
+		}
+
+		typ = typ.Elem()
+	}
+
+	// Ensure that the value is zeroed out so we can write to it. We don't zero
+	// out in the loop, since that would be zeroing out the pointers.
+	ZeroOut(ptr, typ.Size())
+
+	return typ, ptr
 }
 
 // SliceInfo returns the backing array pointer and length of the slice at the
