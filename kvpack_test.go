@@ -2,7 +2,7 @@ package kvpack
 
 import (
 	"encoding/binary"
-	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -10,33 +10,42 @@ import (
 
 	"github.com/diamondburned/kvpack/defract"
 	"github.com/diamondburned/kvpack/driver"
+	"github.com/go-test/deep"
 )
 
 type mockTx struct {
 	// use strings, which is slower but easier to test
 	v map[string]string
+	t *testing.T
 }
 
 var (
-	_ driver.Transaction    = (*mockTx)(nil)
-	_ driver.ManualIterator = (*mockTx)(nil)
+	_ driver.Transaction       = (*mockTx)(nil)
+	_ driver.UnorderedIterator = (*mockTx)(nil)
 )
 
-func newMockTx(cap int) *mockTx {
-	return &mockTx{make(map[string]string, cap)}
+func newMockTx(t *testing.T, cap int) *mockTx {
+	return &mockTx{make(map[string]string, cap), t}
 }
 
 func (tx *mockTx) Commit() error   { return nil }
 func (tx *mockTx) Rollback() error { return nil }
 
-var errNotFoundTest = errors.New("not found")
+type notFoundTestError struct{ key string }
+
+func (err notFoundTestError) Error() string {
+	return fmt.Sprintf("key %q not found", err.key)
+}
 
 func (tx *mockTx) Get(k []byte, fn func([]byte) error) error {
 	b, ok := tx.v[string(k)]
 	if ok {
 		return fn([]byte(b))
 	}
-	return errNotFoundTest
+	if tx.t != nil {
+		tx.t.Logf("tried accessing non-existent key %q", k)
+	}
+	return nil
 }
 
 func (tx *mockTx) Put(k, v []byte) error {
@@ -44,24 +53,7 @@ func (tx *mockTx) Put(k, v []byte) error {
 	return nil
 }
 
-func (tx *mockTx) Iterate([]byte, func(k, v []byte) error) error {
-	return driver.ErrUnsupportedIterator
-}
-
-func (tx *mockTx) IterateManually(next func() []byte, fn func(v []byte) error) error {
-	for key := next(); key != nil; key = next() {
-		v, ok := tx.v[string(key)]
-		if ok {
-			if err := fn([]byte(v)); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-func (tx *mockTx) IteratePrefix(prefix []byte, fn func(k, v []byte) error) error {
+func (tx *mockTx) IterateUnordered(prefix []byte, fn func(k, v []byte) error) error {
 	prefixString := string(prefix)
 
 	for k, v := range tx.v {
@@ -85,9 +77,22 @@ func (tx *mockTx) DeletePrefix(prefix []byte) error {
 	return nil
 }
 
-func (tx *mockTx) expect(t *testing.T, ns, key string, o map[string]string) {
+func (tx *mockTx) expect(ns, key string, o map[string]string) {
+	if tx.t == nil {
+		panic("tx.t is nil while expect() called")
+	}
+
 	makeFullKey := func(k string) string {
-		return string(Namespace + Separator + ns + Separator + key + Separator + k)
+		if k != "" {
+			k = Separator + k
+		}
+		return string(Namespace + Separator + ns + Separator + key + k)
+	}
+
+	// Copy all the keys so we can keep track of which one is found.
+	keys := make(map[string]struct{}, len(tx.v))
+	for k := range tx.v {
+		keys[k] = struct{}{}
 	}
 
 	for k, v := range o {
@@ -95,21 +100,21 @@ func (tx *mockTx) expect(t *testing.T, ns, key string, o map[string]string) {
 
 		got, ok := tx.v[fullKey]
 		if !ok {
-			t.Errorf("missing key %q value %q", fullKey, v)
+			tx.t.Errorf("missing key %q value %q", fullKey, v)
 			continue
 		}
 
 		if got != v {
-			t.Errorf("key %q value expected %q, got %q", fullKey, v, got)
+			tx.t.Errorf("key %q value expected %q, got %q", fullKey, v, got)
 			continue
 		}
 
-		delete(tx.v, fullKey)
+		delete(keys, fullKey)
 		delete(o, k)
 	}
 
-	for k, v := range tx.v {
-		t.Errorf("excess key %q value %q", k, v)
+	for k := range keys {
+		tx.t.Errorf("excess key %q value %q", k, tx.v[k])
 	}
 }
 
@@ -169,7 +174,7 @@ func TestTransactionStruct(t *testing.T) {
 		Strings  []string
 		MoreNums []int
 		Maps     maps
-		junk     string
+		junk     string `deep:"-"` // unexpected so ignore
 	}
 
 	testValue := animals{
@@ -219,7 +224,8 @@ func TestTransactionStruct(t *testing.T) {
 				-100: 100000,
 			},
 			F64: map[float64][]byte{
-				math.NaN():   []byte("NaN lol"),
+				// Don't test NaN; it's always unequal, so it's the most useless
+				// map key.
 				math.Inf(+1): []byte("infty"),
 				math.Inf(-1): []byte("neg infty"),
 				-0:           []byte("negative zero?!"),
@@ -232,12 +238,9 @@ func TestTransactionStruct(t *testing.T) {
 		junk: "ignore me",
 	}
 
-	kv := newMockTx(1)
+	kv := newMockTx(t, 1)
 	tx := newTestTx(kv, "kvpack_test")
-
-	if err := tx.Put([]byte("animals"), &testValue); err != nil {
-		t.Fatal("failed to put:", err)
-	}
+	defer tx.Rollback()
 
 	f := func(fields ...string) string {
 		return strings.Join(fields, Separator)
@@ -246,64 +249,91 @@ func TestTransactionStruct(t *testing.T) {
 	// make this function shorter for tests
 	n := copyNumBytes
 
-	kv.expect(t, "kvpack_test", "animals", map[string]string{
-		f("Cats"):   "meow",
-		f("Dogs"):   "woof",
-		f("SoTrue"): "\x01",
+	t.Run("put", func(t *testing.T) {
+		if err := tx.Put([]byte("animals"), &testValue); err != nil {
+			t.Fatal("failed to put:", err)
+		}
 
-		f("Extinct", "Dinosaurs"): "???",
+		kv.expect("kvpack_test", "animals", map[string]string{
+			"":          "",
+			f("Cats"):   "meow",
+			f("Dogs"):   "woof",
+			f("SoTrue"): "\x01",
 
-		f("Numbers", "Byte"): "\x01",
-		f("Numbers", "Int"):  n(int(math.MaxInt)),
-		f("Numbers", "Uint"): n(uint(math.MaxUint)),
-		f("Numbers", "I8"):   n(int8(math.MaxInt8)),
-		f("Numbers", "I16"):  n(int16(math.MaxInt16)),
-		f("Numbers", "I32"):  n(int32(math.MaxInt32)),
-		f("Numbers", "I64"):  n(int64(math.MaxInt64)),
-		f("Numbers", "U8"):   n(uint8(math.MaxUint8)),
-		f("Numbers", "U16"):  n(uint16(math.MaxUint16)),
-		f("Numbers", "U32"):  n(uint32(math.MaxUint32)),
-		f("Numbers", "U64"):  n(uint64(math.MaxUint64)),
-		f("Numbers", "F32"):  n(float32(math.MaxFloat32)),
-		f("Numbers", "F64"):  n(float64(math.MaxFloat64)),
-		f("Numbers", "C64"):  n(complex64(5 + 6i)),
-		f("Numbers", "C128"): n(complex128(10 + 12i)),
+			f("Extinct"):              "",
+			f("Extinct", "Dinosaurs"): "???",
 
-		f("More", "Cats"): "nya nya",
-		f("More", "Dogs"): "wan wan",
+			f("Numbers"):         "",
+			f("Numbers", "Byte"): "\x01",
+			f("Numbers", "Int"):  n(int(math.MaxInt)),
+			f("Numbers", "Uint"): n(uint(math.MaxUint)),
+			f("Numbers", "I8"):   n(int8(math.MaxInt8)),
+			f("Numbers", "I16"):  n(int16(math.MaxInt16)),
+			f("Numbers", "I32"):  n(int32(math.MaxInt32)),
+			f("Numbers", "I64"):  n(int64(math.MaxInt64)),
+			f("Numbers", "U8"):   n(uint8(math.MaxUint8)),
+			f("Numbers", "U16"):  n(uint16(math.MaxUint16)),
+			f("Numbers", "U32"):  n(uint32(math.MaxUint32)),
+			f("Numbers", "U64"):  n(uint64(math.MaxUint64)),
+			f("Numbers", "F32"):  n(float32(math.MaxFloat32)),
+			f("Numbers", "F64"):  n(float64(math.MaxFloat64)),
+			f("Numbers", "C64"):  n(complex64(5 + 6i)),
+			f("Numbers", "C128"): n(complex128(10 + 12i)),
 
-		f("Quirks", "BoolPtr"):   "\x00",
-		f("Quirks", "StringPtr"): "",
+			f("More"):         "",
+			f("More", "Cats"): "nya nya",
+			f("More", "Dogs"): "wan wan",
 
-		f("Strings", "l"):         n(int64(3)),
-		f("Strings", n(int64(0))): "Astolfo",
-		f("Strings", n(int64(1))): "Felix",
-		f("Strings", n(int64(2))): "idk lol",
+			f("Quirks"):              "",
+			f("Quirks", "BoolPtr"):   "\x00",
+			f("Quirks", "StructPtr"): "",
+			f("Quirks", "StringPtr"): "",
 
-		f("MoreNums", "l"):         n(int64(9)),
-		f("MoreNums", n(int64(0))): n(int(1)),
-		f("MoreNums", n(int64(1))): n(int(2)),
-		f("MoreNums", n(int64(2))): n(int(3)),
-		f("MoreNums", n(int64(3))): n(int(4)),
-		f("MoreNums", n(int64(4))): n(int(2)),
-		f("MoreNums", n(int64(5))): n(int(0)),
-		f("MoreNums", n(int64(6))): n(int(6)),
-		f("MoreNums", n(int64(7))): n(int(9)),
-		f("MoreNums", n(int64(8))): n(int(10)),
+			f("Strings"):              n(int64(3)),
+			f("Strings", n(int64(0))): "Astolfo",
+			f("Strings", n(int64(1))): "Felix",
+			f("Strings", n(int64(2))): "idk lol",
 
-		f("Maps", "Uint", n(uint(0))):      n(int(-1)),
-		f("Maps", "Uint", n(uint(100000))): n(int(-100)),
+			f("MoreNums"):              n(int64(9)),
+			f("MoreNums", n(int64(0))): n(int(1)),
+			f("MoreNums", n(int64(1))): n(int(2)),
+			f("MoreNums", n(int64(2))): n(int(3)),
+			f("MoreNums", n(int64(3))): n(int(4)),
+			f("MoreNums", n(int64(4))): n(int(2)),
+			f("MoreNums", n(int64(5))): n(int(0)),
+			f("MoreNums", n(int64(6))): n(int(6)),
+			f("MoreNums", n(int64(7))): n(int(9)),
+			f("MoreNums", n(int64(8))): n(int(10)),
 
-		f("Maps", "Int", n(int(-1))):   n(uint(0)),
-		f("Maps", "Int", n(int(-100))): n(uint(100000)),
+			f("Maps"):                                  "",
+			f("Maps", "Uint"):                          n(int64(2)),
+			f("Maps", "Uint", n(uint(0))):              n(int(-1)),
+			f("Maps", "Uint", n(uint(100000))):         n(int(-100)),
+			f("Maps", "Int"):                           n(int64(2)),
+			f("Maps", "Int", n(int(-1))):               n(uint(0)),
+			f("Maps", "Int", n(int(-100))):             n(uint(100000)),
+			f("Maps", "F64"):                           n(uint64(3)),
+			f("Maps", "F64", n(float64(math.Inf(+1)))): "infty",
+			f("Maps", "F64", n(float64(math.Inf(-1)))): "neg infty",
+			f("Maps", "F64", n(float64(-0))):           "negative zero?!",
+			f("Maps", "Strs"):                          n(int64(2)),
+			f("Maps", "Strs", "hello"):                 "world",
+			f("Maps", "Strs", "felix"):                 "argyle",
+		})
+	})
 
-		f("Maps", "F64", n(float64(math.NaN()))):   "NaN lol",
-		f("Maps", "F64", n(float64(math.Inf(+1)))): "infty",
-		f("Maps", "F64", n(float64(math.Inf(-1)))): "neg infty",
-		f("Maps", "F64", n(float64(-0))):           "negative zero?!",
+	t.Run("get", func(t *testing.T) {
+		var gotValue animals
 
-		f("Maps", "Strs", "hello"): "world",
-		f("Maps", "Strs", "felix"): "argyle",
+		if err := tx.Access("animals", &gotValue); err != nil {
+			t.Fatal("failed to access animals:", err)
+		}
+
+		if ineqs := deep.Equal(testValue, gotValue); ineqs != nil {
+			for _, ineq := range ineqs {
+				t.Errorf("expect != got: %q", ineq)
+			}
+		}
 	})
 }
 
@@ -341,6 +371,7 @@ func TestAppendKey(t *testing.T) {
 		buf    []byte
 		key    []byte
 		extra  int
+		padded int
 		expect expect
 	}
 
@@ -357,7 +388,7 @@ func TestAppendKey(t *testing.T) {
 			buf:    []byte("hi"),
 			key:    []byte("key"),
 			extra:  3,
-			expect: expect{"hi\x00key", "\x00\x00\x00"},
+			expect: expect{"hi\x00key\x00\x00\x00", "\x00\x00\x00"},
 		},
 		{
 			name: "3 extra reuse",
@@ -371,13 +402,20 @@ func TestAppendKey(t *testing.T) {
 			}(),
 			key:    []byte("key"),
 			extra:  3,
-			expect: expect{"hi\x00key", "lol"},
+			expect: expect{"hi\x00keylol", "lol"},
+		},
+		{
+			name:   "3 padded",
+			buf:    []byte("hi"),
+			key:    []byte("hello"),
+			padded: 3,
+			expect: expect{"hi\x00hello", "\x00\x00\x00"},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			new, extra := appendKey(&test.buf, test.key, test.extra)
+			new, extra := appendKey(&test.buf, test.key, test.extra, test.padded)
 			if string(test.expect.key) != string(new) {
 				t.Fatalf("key expected %q, got %q", test.expect.key, new)
 			}

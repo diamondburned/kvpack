@@ -1,6 +1,8 @@
 package defract
 
 import (
+	"bytes"
+	"os/exec"
 	"reflect"
 	"testing"
 	"unsafe"
@@ -99,4 +101,37 @@ func TestIsZero(t *testing.T) {
 	t.Run("4096", func(t *testing.T) { testWithSize(t, 4096, 1) })
 	t.Run("1024000_1", func(t *testing.T) { testWithSize(t, 1024000, 1) })
 	t.Run("1024000_2", func(t *testing.T) { testWithSize(t, 1024000, 1024000/4) })
+}
+
+func TestIsLittleEndian(t *testing.T) {
+	lscpu := exec.Command("lscpu")
+
+	o, err := lscpu.Output()
+	if err != nil {
+		t.Skip("no lscpu:", err)
+	}
+
+	for _, line := range bytes.Split(o, []byte("\n")) {
+		if !bytes.Contains(line, []byte("Byte Order:")) {
+			continue
+		}
+
+		words := bytes.Fields(line)
+		lastTwo := bytes.Join(words[:len(words)-2], []byte(" "))
+
+		switch string(lastTwo) {
+		case "Little Endian":
+			if !IsLittleEndian {
+				t.Fatal("not little endian")
+			}
+		case "Big Endian":
+			if IsLittleEndian {
+				t.Fatal("not big endian")
+			}
+		default:
+			t.Skip("unknown Byte Order value", string(lastTwo))
+		}
+	}
+
+	t.Skip("unrecognized lscpu output")
 }

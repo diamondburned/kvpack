@@ -15,6 +15,8 @@ type Database interface {
 var ErrUnsupportedIterator = errors.New("unsupported iterator")
 
 // Transaction describes a regular transaction with a simple read and write API.
+// Transactions can optionally implement OrderedIterator for quicker array
+// reading. Either Iterators must be implemented to read maps.
 type Transaction interface {
 	Commit() error
 	Rollback() error
@@ -22,30 +24,35 @@ type Transaction interface {
 	// Get gets the value with the given key and passes the value into the given
 	// callback. The value should not be copied if it doesn't have to be; the
 	// callback will never store the byte slice outside. The error returned from
-	// the callback should be passed through.
+	// the callback should be passed through. If the key is not found, then Get
+	// should return a nil error and not call fn.
 	Get(k []byte, fn func([]byte) error) error
 	// Put puts the given value into the given key. It must not keep any of the
 	// given byte slices after the call.
 	Put(k, v []byte) error
-	// Iterate iterates over all keys with the given prefix, in which the actual
-	// key and value will be put into the callback. Databases that don't
-	// implement this interface will not support arrays or objects.
-	Iterate(prefix []byte, fn func(k, v []byte) error) error
 	// DeletePrefix wipes a key with the given prefix.
 	DeletePrefix(prefix []byte) error
 }
 
-// ManualIterator is an interator API that transactions can implement to have an
-// alternative method of iterating over arrays. It is specifically made for
+// OrderedIterator is an interface API that transactions can implement to have a
+// fast path for getting arrays.
+type OrderedIterator interface {
+	// OrderedIterate iterates over all keys with the given prefix, in which the
+	// actual key and value will be put into the callback. Databases that don't
+	// implement this interface will not support arrays or objects.
+	OrderedIterate(prefix []byte, fn func(k, v []byte) error) error
+}
+
+// UnorderedIterator is an iterator API that transactions can implement to have
+// an alternative method of iterating over arrays. It is specifically made for
 // databases that cannot iterate incrementally (but still can iterate), and
 // should not be implemented by databases that can iterate incrementally, since
 // this interface is usually slower.
-type ManualIterator interface {
-	// IterateManually iterates over the keys that the next function returns
-	// until it returns nil. It is used for iterating over slices. The database
-	// must not keep the byte slice returned by next.
-	IterateManually(next func() []byte, fn func(v []byte) error) error
+//
+// If a database cannot iterate quicker in an unordered fashion but can iterate
+// in an ordered way, then it should not implement this interface.
+type UnorderedIterator interface {
 	// IteratePrefix iterates over all keys with the given prefix in undefined
 	// order. It is used for iterating over maps.
-	IteratePrefix(prefix []byte, fn func(k, v []byte) error) error
+	IterateUnordered(prefix []byte, fn func(k, v []byte) error) error
 }

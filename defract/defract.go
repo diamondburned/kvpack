@@ -301,6 +301,10 @@ var zeroes [zeroesLen]byte
 
 // ZeroOut fills the given buffer with zeroes.
 func ZeroOut(ptr unsafe.Pointer, size uintptr) {
+	if ptr == nil {
+		return
+	}
+
 	if copy(unsafe.Slice((*byte)(ptr), size), zeroes[:]) < zeroesLen {
 		return
 	}
@@ -541,25 +545,68 @@ func IndirectOnce(ptr unsafe.Pointer) unsafe.Pointer {
 // type. If the given ptr is not nil, then the memory will be reused.
 func AllocIndirect(typ reflect.Type, ptr unsafe.Pointer) (reflect.Type, unsafe.Pointer) {
 	for typ.Kind() == reflect.Ptr {
-		if ptr != nil {
-			ptr = *(*unsafe.Pointer)(ptr)
-		} else {
-			ptr = unsafe.Pointer(reflect.New(typ).UnsafeAddr())
-		}
-
 		typ = typ.Elem()
-	}
 
-	// Ensure that the value is zeroed out so we can write to it. We don't zero
-	// out in the loop, since that would be zeroing out the pointers.
-	ZeroOut(ptr, typ.Size())
+		// Ensure that the value at the pointer is not nil if it's a pointer; if
+		// it is, allocate a new one on the heap.
+		if *(*unsafe.Pointer)(ptr) == nil {
+			newPtr := unsafe.Pointer(reflect.New(typ).Pointer())
+			*(*unsafe.Pointer)(ptr) = newPtr
+			ptr = newPtr
+		} else {
+			ptr = *(*unsafe.Pointer)(ptr)
+		}
+	}
 
 	return typ, ptr
 }
 
 // SliceInfo returns the backing array pointer and length of the slice at the
 // given pointer.
-func SliceInfo(ptr unsafe.Pointer) (unsafe.Pointer, int) {
+func SliceInfo(ptr unsafe.Pointer) (unsafe.Pointer, int, int) {
+	if *(*unsafe.Pointer)(ptr) == nil {
+		return nil, 0, 0
+	}
+
 	return unsafe.Pointer((*reflect.SliceHeader)(ptr).Data),
-		(*reflect.SliceHeader)(ptr).Len
+		(*reflect.SliceHeader)(ptr).Len,
+		(*reflect.SliceHeader)(ptr).Cap
+}
+
+// StringInfo returns the backing array pointer and length of the string at the
+// given pointer. It also works with byte slices.
+func StringInfo(ptr unsafe.Pointer) (unsafe.Pointer, int) {
+	if *(*unsafe.Pointer)(ptr) == nil {
+		return nil, 0
+	}
+
+	return unsafe.Pointer((*reflect.StringHeader)(ptr).Data),
+		(*reflect.StringHeader)(ptr).Len
+}
+
+//go:linkname unsafe_NewArray reflect.unsafe_NewArray
+func unsafe_NewArray(typ unsafe.Pointer, n int) unsafe.Pointer
+
+// AllocSlice allocates a slice that is len*typsize bytes large. The returned
+// pointer is the data pointer.
+func AllocSlice(ptr unsafe.Pointer, typ reflect.Type, len int64) unsafe.Pointer {
+	new := reflect.MakeSlice(typ, int(len), int(len))
+	reflect.NewAt(typ, ptr).Elem().Set(new)
+
+	return unsafe.Pointer(new.Pointer())
+
+	// 	*(*[]byte)(ptr) = make([]byte, int(len)*int(typ.Size()))
+
+	// 	(*reflect.SliceHeader)(ptr).Len = int(len)
+	// 	(*reflect.SliceHeader)(ptr).Cap = int(len)
+
+	// 	return unsafe.Pointer(&(*((*[]byte)(ptr)))[0])
+}
+
+// SliceSetLen sets the length of the slice at the given pointer and returns the
+// pointer to the backing array.
+func SliceSetLen(ptr unsafe.Pointer, len int64) unsafe.Pointer {
+	h := (*reflect.SliceHeader)(ptr)
+	h.Len = int(len)
+	return unsafe.Pointer(h.Data)
 }

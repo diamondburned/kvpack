@@ -40,15 +40,18 @@ type Transaction struct {
 
 	// lazy contains fields lazily filled.
 	lazy struct {
-		manualIter   driver.ManualIterator
-		manualIterOk bool
+		orderedIter   driver.OrderedIterator
+		orderedIterOk bool
+		manualIter    driver.UnorderedIterator
+		manualIterOk  bool
 	}
 }
 
 // NewTransaction creates a new transaction from an existing one. This is useful
 // for working around Database's limited APIs.
 func NewTransaction(tx driver.Transaction, namespace string) *Transaction {
-	ns := keyPool.Get().([]byte)
+	// ns := keyPool.Get().([]byte)
+	ns := make([]byte, 0, 4096)
 	ns = append(ns, namespace...)
 
 	return &Transaction{
@@ -165,9 +168,6 @@ func (tx *Transaction) putValue(
 		return tx.tx.Put(k, b.Bytes)
 
 	case reflect.String:
-		// We can treat a string like a []byte as long as we don't touch the
-		// capacity. It is likely a better idea to use reflect.StringHeader,
-		// though.
 		return tx.putBytes(k, ptr)
 
 	case reflect.Slice:
@@ -190,14 +190,15 @@ func (tx *Transaction) putValue(
 }
 
 func (tx *Transaction) putBytes(k []byte, ptr unsafe.Pointer) error {
-	bytes := *(*[]byte)(ptr)
-	if len(bytes) == 0 {
+	// Pull only the dat and length out.
+	backing, len := defract.StringInfo(ptr)
+	if len == 0 {
 		// Empty string, so put nothing. Accessing [0] will cause out of
 		// bounds.
 		return tx.tx.Put(k, nil)
 	}
 
-	return tx.tx.Put(k, unsafe.Slice(&bytes[0], len(bytes)))
+	return tx.tx.Put(k, unsafe.Slice((*byte)(backing), len))
 }
 
 func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
@@ -212,27 +213,22 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 
 	// Keeping this as int64 is possibly slower on 32-bit architecture machines,
 	// but most machines should be 64-bit nowadays.
-	dataPtr, length := defract.SliceInfo(ptr)
+	dataPtr, length, _ := defract.SliceInfo(ptr)
 	length64 := int64(length)
 
-	// Write the slice length into a separate key so we can preallocate the
-	// slice when we obtain it.
-	lengthKey, lengthValue := tx.kb.appendExtra(k, []byte("l"), 8)
+	// Write the slice length conveniently into the same buffer as the key.
+	mapKey, lengthValue := tx.kb.appendPadded(k, 8)
 	defract.WriteInt64LE(lengthValue, length64)
 
-	if err := tx.tx.Put(lengthKey, lengthValue); err != nil {
+	if err := tx.tx.Put(mapKey, lengthValue); err != nil {
 		return errors.Wrap(err, "failed to write slice len")
 	}
 
 	rec++
 
 	for i := int64(0); i < length64; i++ {
-		// We can do this without thinking if this will collide with "l" or not,
-		// because this is always 8 bytes, even with 0.
 		key, extra := tx.kb.appendExtra(k, nil, 8)
 		defract.WriteInt64LE(extra, i)
-		// Slice key to include the extra slice.
-		key = key[:len(key)+8]
 
 		if err := tx.putValue(key, underlying, valueKind, dataPtr, rec); err != nil {
 			return errors.Wrapf(err, "index %d", i)
@@ -252,6 +248,11 @@ func (tx *Transaction) putStruct(
 		return ErrTooRecursed
 	}
 
+	// Indicate that the struct does, in fact, exist.
+	if err := tx.tx.Put(k, nil); err != nil {
+		return errors.Wrap(err, "failed to write struct presence")
+	}
+
 	var err error
 
 	for _, field := range info.Fields {
@@ -265,7 +266,9 @@ func (tx *Transaction) putStruct(
 
 		if field.ChildStruct != nil {
 			if field.Indirect {
-				ptr = defract.IndirectOnce(ptr)
+				if ptr = defract.IndirectOnce(ptr); ptr == nil {
+					return nil
+				}
 			}
 			// Field is a struct, use the fast path and skip the map lookup.
 			err = tx.putStruct(key, field.ChildStruct, ptr, rec+1)
@@ -290,12 +293,12 @@ func (tx *Transaction) putMap(
 		return ErrTooRecursed
 	}
 
-	// keyer gets the reflect.Value's underlying pointer and returns the key.
-	var keyer func(reflect.Value) (key []byte)
-
 	keyType := typ.Key()
 	valueType := typ.Elem()
 	valueKind := valueType.Kind()
+
+	// keyer gets the reflect.Value's underlying pointer and returns the key.
+	var keyer func(reflect.Value) (key []byte)
 
 	switch kind := keyType.Kind(); kind {
 	case reflect.Float32, reflect.Float64,
@@ -341,9 +344,19 @@ func (tx *Transaction) putMap(
 		return fmt.Errorf("unsupported key type %s", keyType)
 	}
 
+	mapValue := reflect.NewAt(typ, ptr).Elem()
+
+	// Write the length.
+	lengthBytes := defract.Int64LE(int64(mapValue.Len()))
+	err := tx.tx.Put(k, lengthBytes.Bytes)
+	lengthBytes.Return()
+
+	if err != nil {
+		return errors.Wrap(err, "failed to write map len")
+	}
+
 	// There's really no choice but to handle maps the slow way.
-	mapIter := reflect.NewAt(typ, ptr).Elem().MapRange()
-	for mapIter.Next() {
+	for mapIter := mapValue.MapRange(); mapIter.Next(); {
 		mapKey := mapIter.Key()
 		mapValue := mapIter.Value()
 
@@ -360,17 +373,6 @@ func (tx *Transaction) putMap(
 	return nil
 }
 
-// manualIterator returns a non-nil ManualIterator if the transaction supports
-// it.
-func (tx *Transaction) manualIterator() driver.ManualIterator {
-	if !tx.lazy.manualIterOk {
-		tx.lazy.manualIter, _ = tx.tx.(driver.ManualIterator)
-		tx.lazy.manualIterOk = true
-	}
-
-	return tx.lazy.manualIter
-}
-
 func (tx *Transaction) Get(k []byte, v interface{}) error {
 	return tx.get(tx.kb.append(tx.ns, k), v)
 }
@@ -382,7 +384,7 @@ func (tx *Transaction) Get(k []byte, v interface{}) error {
 func (tx *Transaction) Access(fields string, v interface{}) error {
 	key := tx.kb.append(tx.ns, []byte(fields))
 	// Replace all periods with the right separator.
-	for i := len(tx.ns) - 1; i < len(key); i++ {
+	for i := len(tx.ns); i < len(key); i++ {
 		if key[i] == '.' {
 			// We know that separator is a single character, which makes this a
 			// lot easier. Had it been more than one, this wouldn't work.
@@ -416,14 +418,9 @@ func (tx *Transaction) get(k []byte, v interface{}) error {
 		})
 	}
 
-	typ := reflect.TypeOf(v)
+	typ, ptr := defract.UnderlyingPtr(v)
 	kind := typ.Kind()
 
-	if kind != reflect.Ptr {
-		return errors.New("given v is not pointer")
-	}
-
-	ptr := defract.InterfacePtr(v)
 	return tx.getValue(k, typ, kind, ptr, 0)
 }
 
@@ -434,12 +431,16 @@ func (tx *Transaction) getValue(
 		return ErrTooRecursed
 	}
 
+	return tx.tx.Get(k, func(b []byte) error {
+		return tx.getValueBytes(k, b, typ, kind, ptr, rec)
+	})
+}
+
+func (tx *Transaction) getValueBytes(
+	k, b []byte, typ reflect.Type, kind reflect.Kind, ptr unsafe.Pointer, rec int) error {
+
 	if kind == reflect.Ptr {
 		typ, ptr = defract.AllocIndirect(typ, ptr)
-		if ptr == nil {
-			// Do nothing with a nil pointer.
-			return nil
-		}
 	}
 
 	// Comparing Kind is a lot faster.
@@ -447,20 +448,20 @@ func (tx *Transaction) getValue(
 	// Handle uint and int like variable-length integers. These helper functions
 	// pool the backing array, so this should be decently fast.
 	case reflect.Uint, reflect.Int:
-		return tx.tx.Get(k, func(b []byte) error {
-			if !defract.ReadVarInt(b, kind, ptr) {
-				return errors.New("(u)varint overflow")
-			}
-			return nil
-		})
+		if !defract.ReadVarInt(b, kind, ptr) {
+			return errors.New("(u)varint overflow")
+		}
+		return nil
 
 	case reflect.Bool:
+		if len(b) == 0 {
+			return io.ErrUnexpectedEOF
+		}
+
 		// A bool can probably be treated as 1 byte, so we can check the first
 		// byte if it's 0 or 1.
-		return tx.tx.Get(k, func(b []byte) error {
-			*(*bool)(ptr) = b[0] != 0
-			return nil
-		})
+		*(*bool)(ptr) = b[0] != 0
+		return nil
 
 	case
 		reflect.Float32, reflect.Float64,
@@ -468,25 +469,17 @@ func (tx *Transaction) getValue(
 		reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 
-		return tx.tx.Get(k, func(b []byte) error {
-			if !defract.ReadNumberLE(b, kind, ptr) {
-				return io.ErrUnexpectedEOF
-			}
-			return nil
-		})
+		if !defract.ReadNumberLE(b, kind, ptr) {
+			return io.ErrUnexpectedEOF
+		}
+		return nil
 
 	case reflect.String:
-		return tx.tx.Get(k, func(b []byte) error {
-			*(*string)(ptr) = string(b) // copies
-			return nil
-		})
+		*(*string)(ptr) = string(b) // copies
+		return nil
 
 	case reflect.Slice:
-		if typ != defract.ByteSlice {
-			return tx.getSlice(k, typ, ptr, rec+1)
-		}
-
-		return tx.tx.Get(k, func(b []byte) error {
+		if typ == defract.ByteSlice {
 			dst := (*[]byte)(ptr)
 			// If the existing slice has enough capacity, then we can
 			// directly copy over.
@@ -498,47 +491,230 @@ func (tx *Transaction) getValue(
 			}
 			copy(*dst, b)
 			return nil
-		})
+		}
+
+		return tx.getSlice(k, b, typ, ptr, rec+1)
 
 	case reflect.Array:
 		panic("TODO: array")
 
 	case reflect.Struct:
-		return tx.putStruct(k, defract.GetStructInfo(typ), ptr, rec+1)
+		return tx.getStruct(k, defract.GetStructInfo(typ), ptr, rec+1)
 
 	case reflect.Map:
-		return tx.putMap(k, typ, ptr, rec+1)
+		return tx.getMap(k, b, typ, ptr, rec+1)
 	}
 
 	return fmt.Errorf("unknown type %s", typ)
 }
 
-func (tx *Transaction) getSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
-	panic("TODO")
+// orderedIterator returns a non-nil OrderedIterator if the transaction supports
+// it.
+func (tx *Transaction) orderedIterator() driver.OrderedIterator {
+	if !tx.lazy.orderedIterOk {
+		tx.lazy.orderedIter, _ = tx.tx.(driver.OrderedIterator)
+		tx.lazy.orderedIterOk = true
+	}
+
+	return tx.lazy.orderedIter
+}
+
+func (tx *Transaction) getSlice(
+	k, lenBytes []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
+
+	if rec > recursionLimit {
+		return ErrTooRecursed
+	}
+
+	length64, ok := defract.ReadInt64LE(lenBytes)
+	if !ok {
+		return io.ErrUnexpectedEOF
+	}
+	if length64 == 0 {
+		return nil
+	}
+
+	underlying := typ.Elem()
+	valueKind := underlying.Kind()
+	valueSize := underlying.Size()
+
+	var dataPtr unsafe.Pointer
+
+	// Ensure the slice has enough capacity.
+	if _, _, cap := defract.SliceInfo(ptr); int64(cap) < length64 {
+		// Allocate a new slice with the known size.
+		dataPtr = defract.AllocSlice(ptr, typ, length64)
+	} else {
+		// Otherwise, reuse the backing array.
+		dataPtr = defract.SliceSetLen(ptr, length64)
+	}
+
+	rec++
+
+	if iter := tx.orderedIterator(); iter != nil {
+		// Make a new key with the trailing separator so the length doesn't get
+		// included.
+		key := tx.kb.append(k, nil)
+
+		return iter.OrderedIterate(key, func(k, v []byte) error {
+			// Skip excess data to avoid going out of bounds.
+			if length64 <= 0 {
+				return nil
+			}
+
+			if err := tx.getValueBytes(k, v, underlying, valueKind, dataPtr, rec); err != nil {
+				return err
+			}
+
+			dataPtr = unsafe.Add(dataPtr, valueSize)
+			length64--
+			return nil
+		})
+	}
+
+	for i := int64(0); i < length64; i++ {
+		key, extra := tx.kb.appendExtra(k, nil, 8)
+		defract.WriteInt64LE(extra, i)
+
+		if err := tx.tx.Get(key, func(b []byte) error {
+			return tx.getValue(key, underlying, valueKind, dataPtr, rec)
+		}); err != nil {
+			return errors.Wrapf(err, "index %d", i)
+		}
+
+		dataPtr = unsafe.Add(dataPtr, valueSize)
+	}
+
+	return nil
 }
 
 func (tx *Transaction) getStruct(
 	k []byte, info *defract.StructInfo, ptr unsafe.Pointer, rec int) error {
 
-	var length int64
-	if err := tx.tx.Get(tx.kb.append(k, []byte("l")), func(b []byte) error {
-		var ok bool
-		length, ok = defract.ReadInt64LE(b)
-		if !ok {
-			return io.ErrUnexpectedEOF
-		}
-		return nil
-	}); err != nil {
-		return errors.Wrap(err, "failed to read slice len")
+	if rec > recursionLimit {
+		return ErrTooRecursed
 	}
 
-	panic("TODO")
+	for _, field := range info.Fields {
+		ptr := unsafe.Add(ptr, field.Offset)
+		key := tx.kb.append(k, field.Name)
+
+		if err := tx.getValue(key, field.Type, field.Kind, ptr, rec+1); err != nil {
+			return errors.Wrapf(err, "struct %s field %s", info.Type, field.Name)
+		}
+	}
+
+	return nil
+}
+
+// manualIterator returns a non-nil UnorderedIterator if the transaction supports
+// it.
+func (tx *Transaction) manualIterator() driver.UnorderedIterator {
+	if !tx.lazy.manualIterOk {
+		tx.lazy.manualIter, _ = tx.tx.(driver.UnorderedIterator)
+		tx.lazy.manualIterOk = true
+	}
+
+	return tx.lazy.manualIter
 }
 
 func (tx *Transaction) getMap(
-	k []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
+	k, lenBytes []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
 
-	panic("TODO")
+	length64, ok := defract.ReadInt64LE(lenBytes)
+	if !ok {
+		return io.ErrUnexpectedEOF
+	}
+
+	keyType := typ.Key()
+	valueType := typ.Elem()
+	valueKind := valueType.Kind()
+
+	// Allocate a new temporary value to be written into and copied from.
+	tmpKey := reflect.New(keyType)
+	tmpKeyPtr := unsafe.Pointer(tmpKey.Pointer())
+
+	// Dereference the value for reading.
+	tmpKey = tmpKey.Elem()
+
+	// keyer gets the reflect.Value's underlying pointer and returns the key.
+	// The callback must set the value into tmpValue or tmpPtr.
+	var keyer func([]byte) error
+
+	switch kind := keyType.Kind(); kind {
+	case reflect.Int, reflect.Uint:
+		keyer = func(b []byte) error {
+			// Treat sized integers as uint64 always.
+			if !defract.ReadVarInt(b, kind, tmpKeyPtr) {
+				return io.ErrUnexpectedEOF
+			}
+			return nil
+		}
+	case reflect.Float32, reflect.Float64,
+		reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+
+		keyer = func(b []byte) error {
+			// Treat sized integers as uint64 always.
+			if !defract.ReadNumberLE(b, reflect.Uint64, tmpKeyPtr) {
+				return io.ErrUnexpectedEOF
+			}
+			return nil
+		}
+	case reflect.String:
+		// TODO: fast, zero-alloc path.
+		keyer = func(b []byte) error {
+			*(*string)(tmpKeyPtr) = string(b)
+			return nil
+		}
+	default:
+		return fmt.Errorf("unsupported key type %s", keyType)
+	}
+
+	var mapValue reflect.Value
+
+	if mapPtr := (*unsafe.Pointer)(ptr); *mapPtr == nil {
+		// Current map is nil. Allocate a new map with the exact length. I
+		// probably won't even bother to reuse the old map.
+		mapValue = reflect.MakeMapWithSize(typ, int(length64))
+		// Set this new map in.
+		*mapPtr = unsafe.Pointer(mapValue.Pointer())
+	} else {
+		// Else, reuse the existing map.
+		mapValue = reflect.NewAt(typ, *mapPtr).Elem()
+	}
+
+	dbPrefix := tx.kb.append(k, nil)
+
+	onValue := func(k, v []byte) error {
+		mapKey := k[len(dbPrefix):]
+		if err := keyer(mapKey); err != nil {
+			return errors.Wrapf(err, "key error at key %q", mapKey)
+		}
+
+		// Values may be pointers (e.g. slices), so allocate a new value for
+		// each.
+		// Allocate a temporary value for the map value as well.
+		tmpValue := reflect.New(valueType)
+		tmpValuePtr := unsafe.Pointer(tmpValue.Pointer())
+
+		if err := tx.getValueBytes(k, v, valueType, valueKind, tmpValuePtr, rec+1); err != nil {
+			return errors.Wrapf(err, "value error at key %q", mapKey)
+		}
+
+		mapValue.SetMapIndex(tmpKey, tmpValue.Elem())
+		return nil
+	}
+
+	if iterator := tx.manualIterator(); iterator != nil {
+		return iterator.IterateUnordered(dbPrefix, onValue)
+	}
+
+	if iterator := tx.orderedIterator(); iterator != nil {
+		return iterator.OrderedIterate(dbPrefix, onValue)
+	}
+
+	return errors.New("tx does not implement ManualIterator or OrderedIterator")
 }
 
 // reusableKey describes a buffer where keys are appended into a single,
@@ -556,9 +732,10 @@ func (kb *keybuf) append(dst, data []byte) []byte {
 }
 
 // appendExtra appends data into dst while reserving the extra few bytes at the
-// end.
+// end right after data without any separators. If data is nil, then the
+// delimiter is right on the left of the extra slice.
 func (kb *keybuf) appendExtra(dst, data []byte, extra int) (newBuf, extraBuf []byte) {
-	newBuf, extraBuf = appendKey(&dst, data, extra)
+	newBuf, extraBuf = appendKey(&dst, data, extra, 0)
 
 	if &kb.buffer[0] != &newBuf[0] {
 		// Slice is grown; update the backing array.
@@ -568,28 +745,58 @@ func (kb *keybuf) appendExtra(dst, data []byte, extra int) (newBuf, extraBuf []b
 	return newBuf, extraBuf
 }
 
+// appendPadded is similar to appendExtra, except data is never appended, and
+// newBuf does not contain the padded bytes..
+func (kb *keybuf) appendPadded(dst []byte, padded int) (newBuf, paddedBuf []byte) {
+	newBuf, paddedBuf = appendKey(&dst, nil, 0, padded)
+
+	if &kb.buffer[0] != &newBuf[0] {
+		// Slice is grown; update the backing array.
+		kb.buffer = newBuf[:len(kb.buffer)]
+	}
+
+	return newBuf, paddedBuf
+}
+
 // appendKey appends into the given buffer the key that's separated by the
 // separator. If extra is not 0, then an additional region at the end of the
 // buffer is reserved into the extra slice.
-func appendKey(buf *[]byte, k []byte, extra int) (newBuf, extraBuf []byte) {
+func appendKey(buf *[]byte, k []byte, extra, padded int) (newBuf, otherBuf []byte) {
 	bufHeader := *buf
 
-	if cap(bufHeader) < len(bufHeader)+len(k)+len(Separator)+extra {
+	// Don't write k if it's nil and padded > 0.
+	hasK := k != nil || padded == 0
+
+	if min := len(bufHeader) + len(k) + len(Separator) + extra + padded; cap(bufHeader) < min {
 		// Existing key slice is not enough, so allocate a new one.
-		key := make([]byte, len(bufHeader)+len(Separator)+len(k)+extra)
+		bufHeader = make([]byte, min)
 
-		var i int
-		i += copy(key[i:], bufHeader)
-		i += copy(key[i:], Separator)
-		i += copy(key[i:], k)
+		i := 0
+		i += copy(bufHeader[i:], *buf)
+		if hasK {
+			i += copy(bufHeader[i:], Separator)
+			i += copy(bufHeader[i:], k)
+		}
 
-		*buf = key[:len(bufHeader)]
-		return key[:i], key[i:]
+		bufHeader = bufHeader[:i]
+
+		// Set the backing array.
+		*buf = bufHeader[:len(*buf)]
+	} else if hasK {
+		bufHeader = append(bufHeader, Separator...)
+		bufHeader = append(bufHeader, k...)
 	}
 
-	bufHeader = append(bufHeader, Separator...)
-	bufHeader = append(bufHeader, k...)
-	return bufHeader, bufHeader[len(bufHeader) : len(bufHeader)+extra]
+	if padded > 0 {
+		return bufHeader, bufHeader[len(bufHeader) : len(bufHeader)+padded]
+	}
+
+	if extra > 0 {
+		end := len(bufHeader) + extra
+		return bufHeader[:end], bufHeader[len(bufHeader):end]
+	}
+
+	return bufHeader, nil
 }
 
 // Database describes a database that's managed by kvpack. A database is safe to

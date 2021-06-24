@@ -47,6 +47,7 @@ func BenchmarkPutKVPack(b *testing.B) {
 	v := benchmarkValue
 
 	tx := newTestTx(noopTx{}, "kvpack_test")
+	defer tx.Rollback()
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -79,6 +80,48 @@ func BenchmarkPutJSON(b *testing.B) {
 
 		if err := db.Put(k, buf.Bytes()); err != nil {
 			b.Fatal("failed to put:", err)
+		}
+	}
+}
+
+func BenchmarkGetKVPack(b *testing.B) {
+	k := []byte("best_character")
+	v := benchmarkStruct{}
+
+	db := newMockTx(nil, 1)
+	tx := newTestTx(db, "kvpack_test")
+	defer tx.Rollback()
+
+	if err := tx.Put(k, benchmarkValue); err != nil {
+		b.Fatal("failed to prep: put:", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if err := tx.Get(k, &v); err != nil {
+			b.Fatal("failed to get:", err)
+		}
+	}
+}
+
+func BenchmarkGetJSON(b *testing.B) {
+	k := []byte("best_character")
+	v := benchmarkStruct{}
+	db := newMockTx(nil, 1)
+
+	jsonData, _ := json.Marshal(benchmarkValue)
+	db.Put(k, jsonData)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if err := db.Get(k, func(b []byte) error {
+			return json.Unmarshal(b, &v)
+		}); err != nil {
+			b.Fatal("failed to decode:", err)
 		}
 	}
 }
