@@ -1,7 +1,6 @@
 package kvpack
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math"
 	"reflect"
@@ -15,7 +14,7 @@ import (
 
 type mockTx struct {
 	// use strings, which is slower but easier to test
-	v map[string]string
+	v map[string][]byte
 	t *testing.T
 }
 
@@ -25,7 +24,7 @@ var (
 )
 
 func newMockTx(t *testing.T, cap int) *mockTx {
-	return &mockTx{make(map[string]string, cap), t}
+	return &mockTx{make(map[string][]byte, cap), t}
 }
 
 func (tx *mockTx) Commit() error   { return nil }
@@ -40,16 +39,13 @@ func (err notFoundTestError) Error() string {
 func (tx *mockTx) Get(k []byte, fn func([]byte) error) error {
 	b, ok := tx.v[string(k)]
 	if ok {
-		return fn([]byte(b))
-	}
-	if tx.t != nil {
-		tx.t.Logf("tried accessing non-existent key %q", k)
+		return fn(b)
 	}
 	return nil
 }
 
 func (tx *mockTx) Put(k, v []byte) error {
-	tx.v[string(k)] = string(v)
+	tx.v[string(k)] = v
 	return nil
 }
 
@@ -58,7 +54,7 @@ func (tx *mockTx) IterateUnordered(prefix []byte, fn func(k, v []byte) error) er
 
 	for k, v := range tx.v {
 		if strings.HasPrefix(k, prefixString) {
-			if err := fn([]byte(k), []byte(v)); err != nil {
+			if err := fn([]byte(k), v); err != nil {
 				return err
 			}
 		}
@@ -104,7 +100,7 @@ func (tx *mockTx) expect(ns, key string, o map[string]string) {
 			continue
 		}
 
-		if got != v {
+		if string(got) != v {
 			tx.t.Errorf("key %q value expected %q, got %q", fullKey, v, got)
 			continue
 		}
@@ -289,51 +285,60 @@ func TestTransactionStruct(t *testing.T) {
 			f("Quirks", "StructPtr"): "",
 			f("Quirks", "StringPtr"): "",
 
-			f("Strings"):              n(int64(3)),
-			f("Strings", n(int64(0))): "Astolfo",
-			f("Strings", n(int64(1))): "Felix",
-			f("Strings", n(int64(2))): "idk lol",
+			f("Strings"):      n(int64(3)),
+			f("Strings", "0"): "Astolfo",
+			f("Strings", "1"): "Felix",
+			f("Strings", "2"): "idk lol",
 
-			f("MoreNums"):              n(int64(9)),
-			f("MoreNums", n(int64(0))): n(int(1)),
-			f("MoreNums", n(int64(1))): n(int(2)),
-			f("MoreNums", n(int64(2))): n(int(3)),
-			f("MoreNums", n(int64(3))): n(int(4)),
-			f("MoreNums", n(int64(4))): n(int(2)),
-			f("MoreNums", n(int64(5))): n(int(0)),
-			f("MoreNums", n(int64(6))): n(int(6)),
-			f("MoreNums", n(int64(7))): n(int(9)),
-			f("MoreNums", n(int64(8))): n(int(10)),
+			f("MoreNums"):      n(int64(9)),
+			f("MoreNums", "0"): n(int(1)),
+			f("MoreNums", "1"): n(int(2)),
+			f("MoreNums", "2"): n(int(3)),
+			f("MoreNums", "3"): n(int(4)),
+			f("MoreNums", "4"): n(int(2)),
+			f("MoreNums", "6"): n(int(6)),
+			f("MoreNums", "7"): n(int(9)),
+			f("MoreNums", "8"): n(int(10)),
 
-			f("Maps"):                                  "",
-			f("Maps", "Uint"):                          n(int64(2)),
-			f("Maps", "Uint", n(uint(0))):              n(int(-1)),
-			f("Maps", "Uint", n(uint(100000))):         n(int(-100)),
-			f("Maps", "Int"):                           n(int64(2)),
-			f("Maps", "Int", n(int(-1))):               n(uint(0)),
-			f("Maps", "Int", n(int(-100))):             n(uint(100000)),
-			f("Maps", "F64"):                           n(uint64(3)),
-			f("Maps", "F64", n(float64(math.Inf(+1)))): "infty",
-			f("Maps", "F64", n(float64(math.Inf(-1)))): "neg infty",
-			f("Maps", "F64", n(float64(-0))):           "negative zero?!",
-			f("Maps", "Strs"):                          n(int64(2)),
-			f("Maps", "Strs", "hello"):                 "world",
-			f("Maps", "Strs", "felix"):                 "argyle",
+			f("Maps"):                   "",
+			f("Maps", "Uint"):           n(int64(2)),
+			f("Maps", "Uint", "0"):      n(int(-1)),
+			f("Maps", "Uint", "100000"): n(int(-100)),
+			f("Maps", "Int"):            n(int64(2)),
+			f("Maps", "Int", "-1"):      n(uint(0)),
+			f("Maps", "Int", "-100"):    n(uint(100000)),
+			f("Maps", "F64"):            n(uint64(3)),
+			f("Maps", "F64", "+Inf"):    "infty",
+			f("Maps", "F64", "-Inf"):    "neg infty",
+			f("Maps", "F64", "0"):       "negative zero?!",
+			f("Maps", "Strs"):           n(int64(2)),
+			f("Maps", "Strs", "hello"):  "world",
+			f("Maps", "Strs", "felix"):  "argyle",
 		})
 	})
 
-	t.Run("get", func(t *testing.T) {
-		var gotValue animals
-
-		if err := tx.Access("animals", &gotValue); err != nil {
-			t.Fatal("failed to access animals:", err)
+	accessAssert := func(key string, unmarshal, expect interface{}) {
+		if err := tx.Access(key, unmarshal); err != nil {
+			t.Fatalf("failed to access %q: %v", key, err)
 		}
 
-		if ineqs := deep.Equal(testValue, gotValue); ineqs != nil {
+		if ineqs := deep.Equal(expect, unmarshal); ineqs != nil {
 			for _, ineq := range ineqs {
 				t.Errorf("expect != got: %q", ineq)
 			}
 		}
+	}
+
+	t.Run("get", func(t *testing.T) {
+		var gotValue animals
+		accessAssert("animals", &gotValue, &testValue)
+
+		var gotMoreNums numbers
+		accessAssert("animals.Numbers", &gotMoreNums, &testValue.Numbers)
+
+		var nthNum int
+		nthNumExpect := 3
+		accessAssert("animals.MoreNums.2", &nthNum, &nthNumExpect)
 	})
 }
 
@@ -342,23 +347,13 @@ func copyNumBytes(v interface{}) string {
 	kind := typ.Kind()
 
 	switch kind {
-	case reflect.Int, reflect.Uint:
-		b := make([]byte, 10)
-		n := 0
-		switch kind {
-		case reflect.Int:
-			n = binary.PutVarint(b, int64(*(*int)(ptr)))
-		case reflect.Uint:
-			n = binary.PutUvarint(b, uint64(*(*uint)(ptr)))
-		}
-		return string(b[:n])
+	case reflect.Int:
+		return string(defract.IntLE((*int)(ptr)))
+	case reflect.Uint:
+		return string(defract.UintLE((*uint)(ptr)))
 	}
 
-	b := defract.NumberLE(kind, ptr)
-	out := string(b.Bytes)
-	b.Return()
-
-	return out
+	return string(defract.NumberLE(kind, ptr))
 }
 
 func TestAppendKey(t *testing.T) {
@@ -371,7 +366,6 @@ func TestAppendKey(t *testing.T) {
 		buf    []byte
 		key    []byte
 		extra  int
-		padded int
 		expect expect
 	}
 
@@ -388,7 +382,7 @@ func TestAppendKey(t *testing.T) {
 			buf:    []byte("hi"),
 			key:    []byte("key"),
 			extra:  3,
-			expect: expect{"hi\x00key\x00\x00\x00", "\x00\x00\x00"},
+			expect: expect{"hi\x00key", "\x00\x00\x00"},
 		},
 		{
 			name: "3 extra reuse",
@@ -396,26 +390,19 @@ func TestAppendKey(t *testing.T) {
 				buf := make([]byte, 128)
 				copy(buf, "hi")
 				// ignore 2
-				// ignore 1 + 3
-				copy(buf[6:], "lol")
+				// ignore 2 + 1 + 3
+				copy(buf[8:], "lol")
 				return buf[:2]
 			}(),
 			key:    []byte("key"),
 			extra:  3,
-			expect: expect{"hi\x00keylol", "lol"},
-		},
-		{
-			name:   "3 padded",
-			buf:    []byte("hi"),
-			key:    []byte("hello"),
-			padded: 3,
-			expect: expect{"hi\x00hello", "\x00\x00\x00"},
+			expect: expect{"hi\x00key", "lol"},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			new, extra := appendKey(&test.buf, test.key, test.extra, test.padded)
+			new, extra := appendArena(&test.buf, test.buf, test.key, test.extra)
 			if string(test.expect.key) != string(new) {
 				t.Fatalf("key expected %q, got %q", test.expect.key, new)
 			}

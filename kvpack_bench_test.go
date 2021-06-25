@@ -65,20 +65,19 @@ func BenchmarkPutJSON(b *testing.B) {
 
 	db := noopTx{}
 
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		buf.Reset()
-
-		if err := enc.Encode(v); err != nil {
+		// Realistically, this would be done in a transaction, and the
+		// transaction will own the byte slices, so we cannot reuse the same
+		// buffer for each value.
+		j, err := json.Marshal(v)
+		if err != nil {
 			b.Fatal("failed to encode:", err)
 		}
 
-		if err := db.Put(k, buf.Bytes()); err != nil {
+		if err := db.Put(k, j); err != nil {
 			b.Fatal("failed to put:", err)
 		}
 	}

@@ -26,98 +26,58 @@ func initByteOrder() struct{} {
 	return struct{}{}
 }
 
+// SliceHeader is the header structure that contains an unsafe.Pointer data
+// field instead of uintptr.
+type SliceHeader struct {
+	Data unsafe.Pointer
+	Len  int
+	Cap  int
+}
+
+// StringHeader is a safer reflect.StringHeader.
+type StringHeader struct {
+	Data unsafe.Pointer
+	Len  int
+}
+
+const correctHeader = true &&
+	unsafe.Sizeof(SliceHeader{}) == unsafe.Sizeof(reflect.SliceHeader{}) &&
+	unsafe.Sizeof(StringHeader{}) == unsafe.Sizeof(reflect.StringHeader{})
+
+func init() {
+	// This will probably be optimized out.
+	if !correctHeader {
+		panic("SliceHeader size mismatch")
+	}
+}
+
 // ByteSlice is the reflect.Type value for a byte slice.
 var ByteSlice = reflect.TypeOf([]byte(nil))
 
-var intBufferPool = sync.Pool{
-	New: func() interface{} { return make([]byte, 10) },
-}
-
-// BorrowedBytes is a type that wraps around a byte slice to allow the caller to
-// borrow it. The caller MUST return those borrowed values using the Return
-// method.
-type BorrowedBytes struct {
-	Bytes []byte
-	taken bool // true if pooled
-}
-
-// Return returns the borrowed bytes back to the internal pool.
-func (b *BorrowedBytes) Return() {
-	if b.taken {
-		// Reset the length of the buffer and put it back.
-		buf := b.Bytes[:10]
-		intBufferPool.Put(buf)
-		// Take the returned buffer away from the caller.
-		b.Bytes = nil
-	}
-}
-
-// Varint is a helper function that converts an integer into a byte slice to be
-// used as a database key.
-func Varint(i int64) BorrowedBytes {
-	b := intBufferPool.Get().([]byte)
-
-	uvarint := b[:binary.PutVarint(b, i)]
-	return BorrowedBytes{uvarint, true}
-}
-
-// Uvarint is a helper function that converts an unsigned integer into a byte
-// slice to be used as a database key.
-func Uvarint(u uint64) BorrowedBytes {
-	b := intBufferPool.Get().([]byte)
-
-	varint := b[:binary.PutUvarint(b, u)]
-	return BorrowedBytes{varint, true}
-}
-
-// ReadVarInt reads a variable-length signed or unsigned integer into the given
-// pointer. False is returned if the number inside the bytes overflow int or
-// uint.
-func ReadVarInt(b []byte, k reflect.Kind, p unsafe.Pointer) bool {
-	switch k {
-	case reflect.Int:
-		v, sz := binary.Varint(b)
-		if sz > 0 {
-			*(*int)(p) = int(v)
-			return true
-		}
-	case reflect.Uint:
-		v, sz := binary.Uvarint(b)
-		if sz > 0 {
-			*(*int)(p) = int(v)
-			return true
-		}
-	default:
-		panic("ReadVarInt got unknown kind " + k.String())
-	}
-
-	return false
-}
-
-// Int64LE is a helper function that converts the given int64 value into bytes,
-// ideally without copying on a little-endian machine. The bytes are always in
-// little-endian.
-func Int64LE(i int64) BorrowedBytes {
-	if IsLittleEndian {
-		return BorrowedBytes{(*[8]byte)(unsafe.Pointer(&i))[:], false}
-	}
-
-	b := intBufferPool.Get().([]byte)
-	binary.LittleEndian.PutUint64(b, uint64(i))
-	return BorrowedBytes{b[:8], true}
-}
-
-// Uint64LE is a helper function that converts the given uint64 value into
-// bytes, ideally without copying on a little-endian machine. The bytes are
+// IntLE is a helper function that converts the given int value into bytes,
+// ideally without copying on a 64-bit little-endian machine. The bytes are
 // always in little-endian.
-func Uint64LE(i uint64) BorrowedBytes {
-	if IsLittleEndian {
-		return BorrowedBytes{(*[8]byte)(unsafe.Pointer(&i))[:], false}
+func IntLE(i *int) []byte {
+	if unsafe.Sizeof(i) == 8 && IsLittleEndian {
+		return (*[8]byte)(unsafe.Pointer(i))[:]
 	}
 
-	b := intBufferPool.Get().([]byte)
-	binary.LittleEndian.PutUint64(b, uint64(i))
-	return BorrowedBytes{b[:8], true}
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(*i))
+	return b[:]
+}
+
+// UintLE is a helper function that converts the given uint64 value into bytes,
+// ideally without copying on a 64-bit little-endian machine. The bytes are
+// always in little-endian.
+func UintLE(u *uint) []byte {
+	if unsafe.Sizeof(u) == 8 && IsLittleEndian {
+		return (*[8]byte)(unsafe.Pointer(u))[:]
+	}
+
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(*u))
+	return b[:]
 }
 
 // WriteInt64LE writes the given int64 into the given byte slice.
@@ -149,6 +109,28 @@ func ReadInt64LE(dst []byte) (int64, bool) {
 func ReadNumberLE(b []byte, kind reflect.Kind, ptr unsafe.Pointer) bool {
 	if !IsLittleEndian {
 		panic("TODO ReadNumberLE Big Endian")
+	}
+
+	switch kind {
+	case reflect.Int:
+		// This is optimized away, since Sizeof is a constant.
+		switch unsafe.Sizeof(int(0)) {
+		case 4:
+			kind = reflect.Int32
+		case 8:
+			kind = reflect.Int64
+		default:
+			panic("unknown architecture, weird int size")
+		}
+	case reflect.Uint:
+		switch unsafe.Sizeof(uint(0)) {
+		case 4:
+			kind = reflect.Uint32
+		case 8:
+			kind = reflect.Uint64
+		default:
+			panic("unknown architecture, weird uint size")
+		}
 	}
 
 	switch kind {
@@ -244,22 +226,22 @@ func readNumberAsLE(b []byte, kind reflect.Kind, ptr unsafe.Pointer) bool {
 //
 // If this method is called on a Big Endian macnine, then a new byte buffer will
 // be allocated from the pool.
-func NumberLE(kind reflect.Kind, ptr unsafe.Pointer) BorrowedBytes {
+func NumberLE(kind reflect.Kind, ptr unsafe.Pointer) []byte {
 	if !IsLittleEndian {
 		return numberAsLE(kind, ptr)
 	}
 
 	switch kind {
 	case reflect.Uint8, reflect.Int8:
-		return BorrowedBytes{(*[1]byte)(ptr)[:], false}
+		return (*[1]byte)(ptr)[:]
 	case reflect.Uint16, reflect.Int16:
-		return BorrowedBytes{(*[2]byte)(ptr)[:], false}
+		return (*[2]byte)(ptr)[:]
 	case reflect.Uint32, reflect.Int32, reflect.Float32:
-		return BorrowedBytes{(*[4]byte)(ptr)[:], false}
+		return (*[4]byte)(ptr)[:]
 	case reflect.Uint64, reflect.Int64, reflect.Float64, reflect.Complex64:
-		return BorrowedBytes{(*[8]byte)(ptr)[:], false}
+		return (*[8]byte)(ptr)[:]
 	case reflect.Complex128:
-		return BorrowedBytes{(*[16]byte)(ptr)[:], false}
+		return (*[16]byte)(ptr)[:]
 	default:
 		panic("NumberLE got unsupported kind " + kind.String())
 	}
@@ -267,26 +249,25 @@ func NumberLE(kind reflect.Kind, ptr unsafe.Pointer) BorrowedBytes {
 
 // numberAsLE is the slow path. It tries not to allocate by having an internal
 // byte buffer pool.
-func numberAsLE(kind reflect.Kind, ptr unsafe.Pointer) BorrowedBytes {
+func numberAsLE(kind reflect.Kind, ptr unsafe.Pointer) []byte {
 	switch kind {
 	case reflect.Uint8, reflect.Int8:
 		// A single byte is architecture-independent.
-		return BorrowedBytes{(*[1]byte)(ptr)[:], false}
+		return (*[1]byte)(ptr)[:]
 	}
 
-	b := intBufferPool.Get().([]byte)
-	defer intBufferPool.Put(b)
+	var b [8]byte
 
 	switch kind {
 	case reflect.Uint16, reflect.Int16:
-		binary.LittleEndian.PutUint16(b, *(*uint16)(ptr))
-		return BorrowedBytes{b[:2], true}
+		binary.LittleEndian.PutUint16(b[:2], *(*uint16)(ptr))
+		return b[:2]
 	case reflect.Uint32, reflect.Int32, reflect.Float32:
-		binary.LittleEndian.PutUint32(b, *(*uint32)(ptr))
-		return BorrowedBytes{b[:4], true}
+		binary.LittleEndian.PutUint32(b[:4], *(*uint32)(ptr))
+		return b[:4]
 	case reflect.Uint64, reflect.Int64, reflect.Float64, reflect.Complex64:
-		binary.LittleEndian.PutUint64(b, *(*uint64)(ptr))
-		return BorrowedBytes{b[:8], true}
+		binary.LittleEndian.PutUint64(b[:8], *(*uint64)(ptr))
+		return b[:8]
 	case reflect.Complex128:
 		panic("Complex128 unsupported on Big Endian (TODO)")
 	default:
@@ -369,9 +350,9 @@ func isZeroAny(bytes []byte) bool {
 }
 
 var (
-	structCache  = map[unsafe.Pointer]*StructInfo{} // unsafe.Pointer -> *structInfo
-	structMutex  sync.RWMutex
 	structFlight singleflight.Group
+	structMutex  sync.RWMutex
+	structCache  = map[unsafe.Pointer]*StructInfo{} // unsafe.Pointer -> *structInfo
 )
 
 type StructInfo struct {
@@ -422,8 +403,10 @@ func GetStructInfo(typ reflect.Type) *StructInfo {
 	}
 
 	ret, _, _ := structFlight.Do(typeName, func() (interface{}, error) {
-		var info StructInfo
-		info.Type = typ
+		info := StructInfo{
+			Type: typ,
+		}
+
 		info.get(typ)
 
 		structMutex.Lock()
@@ -568,9 +551,7 @@ func SliceInfo(ptr unsafe.Pointer) (unsafe.Pointer, int, int) {
 		return nil, 0, 0
 	}
 
-	return unsafe.Pointer((*reflect.SliceHeader)(ptr).Data),
-		(*reflect.SliceHeader)(ptr).Len,
-		(*reflect.SliceHeader)(ptr).Cap
+	return (*SliceHeader)(ptr).Data, (*SliceHeader)(ptr).Len, (*SliceHeader)(ptr).Cap
 }
 
 // StringInfo returns the backing array pointer and length of the string at the
@@ -580,33 +561,45 @@ func StringInfo(ptr unsafe.Pointer) (unsafe.Pointer, int) {
 		return nil, 0
 	}
 
-	return unsafe.Pointer((*reflect.StringHeader)(ptr).Data),
-		(*reflect.StringHeader)(ptr).Len
+	return (*StringHeader)(ptr).Data, (*StringHeader)(ptr).Len
 }
-
-//go:linkname unsafe_NewArray reflect.unsafe_NewArray
-func unsafe_NewArray(typ unsafe.Pointer, n int) unsafe.Pointer
 
 // AllocSlice allocates a slice that is len*typsize bytes large. The returned
 // pointer is the data pointer.
-func AllocSlice(ptr unsafe.Pointer, typ reflect.Type, len int64) unsafe.Pointer {
-	new := reflect.MakeSlice(typ, int(len), int(len))
-	reflect.NewAt(typ, ptr).Elem().Set(new)
+func AllocSlice(ptr unsafe.Pointer, size, len int64) {
+	// Increment length once to account for the last element in the list.
+	len++
 
-	return unsafe.Pointer(new.Pointer())
-
-	// 	*(*[]byte)(ptr) = make([]byte, int(len)*int(typ.Size()))
-
-	// 	(*reflect.SliceHeader)(ptr).Len = int(len)
-	// 	(*reflect.SliceHeader)(ptr).Cap = int(len)
-
-	// 	return unsafe.Pointer(&(*((*[]byte)(ptr)))[0])
+	*(*[]byte)(ptr) = make([]byte, int(len*size))
+	h := (*SliceHeader)(ptr)
+	h.Len = int(len)
+	h.Cap = int(len)
 }
 
 // SliceSetLen sets the length of the slice at the given pointer and returns the
 // pointer to the backing array.
 func SliceSetLen(ptr unsafe.Pointer, len int64) unsafe.Pointer {
-	h := (*reflect.SliceHeader)(ptr)
-	h.Len = int(len)
-	return unsafe.Pointer(h.Data)
+	(*SliceHeader)(ptr).Len = int(len)
+	return (*SliceHeader)(ptr).Data
+}
+
+// BytesToStr converts the given bytes to string without copying.
+func BytesToStr(bytes []byte) string {
+	// []byte is a larger structure than string, so this is fine.
+	return *(*string)(unsafe.Pointer(&bytes))
+}
+
+// CopyString tries to reduce allocations by reusing the backing array if
+// there's enough length.
+func CopyString(dst unsafe.Pointer, src []byte) {
+	h := (*StringHeader)(dst)
+
+	if h.Data != nil && h.Len >= len(src) {
+		h.Len = len(src)
+		copy(unsafe.Slice((*byte)(h.Data), len(src)), src)
+		return
+	}
+
+	// Reallocate the string the normal way.
+	*(*string)(dst) = string(src)
 }

@@ -1,10 +1,12 @@
 package kvpack
 
 import (
+	"bytes"
 	"fmt"
 	"io"
-	"math"
 	"reflect"
+	"runtime"
+	"strconv"
 	"sync"
 	"unsafe"
 
@@ -27,16 +29,16 @@ const recursionLimit = 1024
 // deeply. When this happens, an error occurs to prevent running out of memory.
 var ErrTooRecursed = errors.New("kvpack recursed too deep (> 1024)")
 
-// keyPool is a pool of 1024-or-larger capacity byte slices.
+// keyPool is a pool of 512KB-or-larger byte slices.
 var keyPool = sync.Pool{
-	New: func() interface{} { return make([]byte, 0, 1024) },
+	New: func() interface{} { return make([]byte, 0, 512*1024) },
 }
 
 // Transaction describes a transaction of a database managed by kvpack.
 type Transaction struct {
 	tx driver.Transaction
 	ns []byte
-	kb keybuf
+	kb keyArena
 
 	// lazy contains fields lazily filled.
 	lazy struct {
@@ -50,14 +52,13 @@ type Transaction struct {
 // NewTransaction creates a new transaction from an existing one. This is useful
 // for working around Database's limited APIs.
 func NewTransaction(tx driver.Transaction, namespace string) *Transaction {
-	// ns := keyPool.Get().([]byte)
-	ns := make([]byte, 0, 4096)
+	ns := keyPool.Get().([]byte)
 	ns = append(ns, namespace...)
 
 	return &Transaction{
 		tx: tx,
 		ns: ns,
-		kb: keybuf{buffer: ns},
+		kb: keyArena{buffer: ns},
 	}
 }
 
@@ -88,7 +89,7 @@ func (tx *Transaction) Delete(k []byte) error {
 // used, and the values are put into the database as-is.
 func (tx *Transaction) Put(k []byte, v interface{}) error {
 	key := tx.kb.append(tx.ns, k)
-	if err := tx.tx.DeletePrefix(k); err != nil {
+	if err := tx.tx.DeletePrefix(key); err != nil {
 		return errors.Wrap(err, "failed to override key")
 	}
 
@@ -141,15 +142,9 @@ func (tx *Transaction) putValue(
 	// Handle uint and int like variable-length integers. These helper functions
 	// pool the backing array, so this should be decently fast.
 	case reflect.Uint:
-		b := defract.Uvarint(uint64(*(*uint)(ptr)))
-		err := tx.tx.Put(k, b.Bytes)
-		b.Return()
-		return err
+		return tx.tx.Put(k, defract.UintLE((*uint)(ptr)))
 	case reflect.Int:
-		b := defract.Varint(int64(*(*int)(ptr)))
-		err := tx.tx.Put(k, b.Bytes)
-		b.Return()
-		return err
+		return tx.tx.Put(k, defract.IntLE((*int)(ptr)))
 
 	case reflect.Bool:
 		// A bool can probably be treated as 1 byte, so we can cast it to that
@@ -162,10 +157,7 @@ func (tx *Transaction) putValue(
 		reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 
-		b := defract.NumberLE(kind, ptr)
-		defer b.Return()
-
-		return tx.tx.Put(k, b.Bytes)
+		return tx.tx.Put(k, defract.NumberLE(kind, ptr))
 
 	case reflect.String:
 		return tx.putBytes(k, ptr)
@@ -217,7 +209,8 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 	length64 := int64(length)
 
 	// Write the slice length conveniently into the same buffer as the key.
-	mapKey, lengthValue := tx.kb.appendPadded(k, 8)
+	mapKey, lengthValue := tx.kb.appendExtra(k, nil, 8)
+	mapKey = mapKey[:len(mapKey)-1]
 	defract.WriteInt64LE(lengthValue, length64)
 
 	if err := tx.tx.Put(mapKey, lengthValue); err != nil {
@@ -227,15 +220,18 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 	rec++
 
 	for i := int64(0); i < length64; i++ {
-		key, extra := tx.kb.appendExtra(k, nil, 8)
-		defract.WriteInt64LE(extra, i)
-
-		if err := tx.putValue(key, underlying, valueKind, dataPtr, rec); err != nil {
-			return errors.Wrapf(err, "index %d", i)
+		elemPtr := unsafe.Add(dataPtr, int64(valueSize)*i)
+		// Skip zero-values.
+		if defract.IsZero(elemPtr, valueSize) {
+			continue
 		}
 
-		// Increment the data pointer for the next loop.
-		dataPtr = unsafe.Add(dataPtr, valueSize)
+		key, extra := tx.kb.appendExtra(k, nil, 30)
+		key = tx.kb.avoidOverflow(strconv.AppendInt(key, i, 10), len(key)+len(extra))
+
+		if err := tx.putValue(key, underlying, valueKind, elemPtr, rec); err != nil {
+			return errors.Wrapf(err, "index %d", i)
+		}
 	}
 
 	return nil
@@ -301,57 +297,48 @@ func (tx *Transaction) putMap(
 	var keyer func(reflect.Value) (key []byte)
 
 	switch kind := keyType.Kind(); kind {
-	case reflect.Float32, reflect.Float64,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+	case reflect.Float32, reflect.Float64:
+		keyer = func(v reflect.Value) []byte {
+			key, extra := tx.kb.appendExtra(k, nil, 300)
 
-		key := func(borrowed defract.BorrowedBytes) []byte {
-			k := tx.kb.append(k, borrowed.Bytes)
-			borrowed.Return()
-			return k
+			return tx.kb.avoidOverflow(
+				strconv.AppendFloat(key, v.Float(), 'f', -1, 64),
+				len(key)+len(extra),
+			)
 		}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		keyer = func(v reflect.Value) []byte {
+			key, extra := tx.kb.appendExtra(k, nil, 20)
 
-		switch kind {
-		case reflect.Float32, reflect.Float64:
-			keyer = func(v reflect.Value) []byte {
-				return key(defract.Uint64LE(math.Float64bits(v.Float())))
-			}
-		case reflect.Int:
-			keyer = func(v reflect.Value) []byte {
-				return key(defract.Varint(v.Int()))
-			}
-		case reflect.Uint:
-			keyer = func(v reflect.Value) []byte {
-				return key(defract.Uvarint(v.Uint()))
-			}
-		case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			keyer = func(v reflect.Value) []byte {
-				return key(defract.Int64LE(v.Int()))
-			}
-		case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			keyer = func(v reflect.Value) []byte {
-				return key(defract.Uint64LE(v.Uint()))
-			}
+			return tx.kb.avoidOverflow(
+				strconv.AppendInt(key, v.Int(), 10),
+				len(key)+len(extra),
+			)
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		keyer = func(v reflect.Value) []byte {
+			key, extra := tx.kb.appendExtra(k, nil, 20)
+
+			return tx.kb.avoidOverflow(
+				strconv.AppendUint(key, v.Uint(), 10),
+				len(key)+len(extra),
+			)
 		}
 	case reflect.String:
 		keyer = func(v reflect.Value) []byte {
-			// Like putBytes, this is safe as long as we don't access the
-			// capacity. Not to mention, mapIter.Value() does a copy.
-			str := v.Interface().(string)
-			return tx.kb.append(k, *(*[]byte)(unsafe.Pointer(&str)))
+			data, len := defract.StringInfo(defract.InterfacePtr(v.Interface()))
+			return tx.kb.append(k, unsafe.Slice((*byte)(data), len))
 		}
 	default:
 		return fmt.Errorf("unsupported key type %s", keyType)
 	}
 
 	mapValue := reflect.NewAt(typ, ptr).Elem()
+	mapLen := mapValue.Len()
+	defer runtime.KeepAlive(&mapLen)
 
 	// Write the length.
-	lengthBytes := defract.Int64LE(int64(mapValue.Len()))
-	err := tx.tx.Put(k, lengthBytes.Bytes)
-	lengthBytes.Return()
-
-	if err != nil {
+	if err := tx.tx.Put(k, defract.IntLE(&mapLen)); err != nil {
 		return errors.Wrap(err, "failed to write map len")
 	}
 
@@ -445,14 +432,6 @@ func (tx *Transaction) getValueBytes(
 
 	// Comparing Kind is a lot faster.
 	switch kind := typ.Kind(); kind {
-	// Handle uint and int like variable-length integers. These helper functions
-	// pool the backing array, so this should be decently fast.
-	case reflect.Uint, reflect.Int:
-		if !defract.ReadVarInt(b, kind, ptr) {
-			return errors.New("(u)varint overflow")
-		}
-		return nil
-
 	case reflect.Bool:
 		if len(b) == 0 {
 			return io.ErrUnexpectedEOF
@@ -466,8 +445,8 @@ func (tx *Transaction) getValueBytes(
 	case
 		reflect.Float32, reflect.Float64,
 		reflect.Complex64, reflect.Complex128,
-		reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 
 		if !defract.ReadNumberLE(b, kind, ptr) {
 			return io.ErrUnexpectedEOF
@@ -475,7 +454,7 @@ func (tx *Transaction) getValueBytes(
 		return nil
 
 	case reflect.String:
-		*(*string)(ptr) = string(b) // copies
+		defract.CopyString(ptr, b)
 		return nil
 
 	case reflect.Slice:
@@ -538,51 +517,45 @@ func (tx *Transaction) getSlice(
 	valueKind := underlying.Kind()
 	valueSize := underlying.Size()
 
-	var dataPtr unsafe.Pointer
-
 	// Ensure the slice has enough capacity.
 	if _, _, cap := defract.SliceInfo(ptr); int64(cap) < length64 {
 		// Allocate a new slice with the known size.
-		dataPtr = defract.AllocSlice(ptr, typ, length64)
-	} else {
-		// Otherwise, reuse the backing array.
-		dataPtr = defract.SliceSetLen(ptr, length64)
+		defract.AllocSlice(ptr, int64(typ.Size()), length64)
 	}
 
-	rec++
+	dataPtr := defract.SliceSetLen(ptr, length64)
 
 	if iter := tx.orderedIterator(); iter != nil {
 		// Make a new key with the trailing separator so the length doesn't get
 		// included.
-		key := tx.kb.append(k, nil)
+		prefix := tx.kb.append(k, nil)
 
-		return iter.OrderedIterate(key, func(k, v []byte) error {
-			// Skip excess data to avoid going out of bounds.
-			if length64 <= 0 {
-				return nil
+		return iter.OrderedIterate(prefix, func(k, v []byte) error {
+			// Trim the key and parse the index.
+			ixBytes := bytes.TrimPrefix(k, prefix)
+
+			i, err := strconv.ParseInt(defract.BytesToStr(ixBytes), 10, 64)
+			if err != nil {
+				return errors.Wrap(err, "ix failed")
+			}
+			if i < 0 || i >= length64 {
+				return errors.New("ix overflow")
 			}
 
-			if err := tx.getValueBytes(k, v, underlying, valueKind, dataPtr, rec); err != nil {
-				return err
-			}
-
-			dataPtr = unsafe.Add(dataPtr, valueSize)
-			length64--
-			return nil
+			elemPtr := unsafe.Add(dataPtr, int64(valueSize)*i)
+			return tx.getValueBytes(k, v, underlying, valueKind, elemPtr, rec+1)
 		})
 	}
 
 	for i := int64(0); i < length64; i++ {
-		key, extra := tx.kb.appendExtra(k, nil, 8)
-		defract.WriteInt64LE(extra, i)
+		k, extra := tx.kb.appendExtra(k, nil, 20)
+		k = tx.kb.avoidOverflow(strconv.AppendInt(k, i, 10), len(k)+len(extra))
 
-		if err := tx.tx.Get(key, func(b []byte) error {
-			return tx.getValue(key, underlying, valueKind, dataPtr, rec)
-		}); err != nil {
+		elemPtr := unsafe.Add(dataPtr, int64(valueSize)*i)
+
+		if err := tx.getValue(k, underlying, valueKind, elemPtr, rec+1); err != nil {
 			return errors.Wrapf(err, "index %d", i)
 		}
-
-		dataPtr = unsafe.Add(dataPtr, valueSize)
 	}
 
 	return nil
@@ -642,29 +615,60 @@ func (tx *Transaction) getMap(
 	var keyer func([]byte) error
 
 	switch kind := keyType.Kind(); kind {
-	case reflect.Int, reflect.Uint:
+	case reflect.Float32, reflect.Float64:
 		keyer = func(b []byte) error {
-			// Treat sized integers as uint64 always.
-			if !defract.ReadVarInt(b, kind, tmpKeyPtr) {
-				return io.ErrUnexpectedEOF
+			f, err := strconv.ParseFloat(defract.BytesToStr(b), 64)
+			if err != nil {
+				return err
 			}
+			tmpKey.SetFloat(f)
 			return nil
 		}
-	case reflect.Float32, reflect.Float64,
-		reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		var bitSize int
+		switch kind {
+		case reflect.Int, reflect.Int64:
+			bitSize = 64
+		case reflect.Int32:
+			bitSize = 32
+		case reflect.Int16:
+			bitSize = 16
+		case reflect.Int8:
+			bitSize = 8
+		}
 		keyer = func(b []byte) error {
-			// Treat sized integers as uint64 always.
-			if !defract.ReadNumberLE(b, reflect.Uint64, tmpKeyPtr) {
-				return io.ErrUnexpectedEOF
+			i, err := strconv.ParseInt(defract.BytesToStr(b), 10, bitSize)
+			if err != nil {
+				return err
 			}
+			tmpKey.SetInt(i)
+			return nil
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		var bitSize int
+		switch kind {
+		case reflect.Uint, reflect.Uint64:
+			bitSize = 64
+		case reflect.Uint32:
+			bitSize = 32
+		case reflect.Uint16:
+			bitSize = 16
+		case reflect.Uint8:
+			bitSize = 8
+		}
+		keyer = func(b []byte) error {
+			u, err := strconv.ParseUint(defract.BytesToStr(b), 10, bitSize)
+			if err != nil {
+				return err
+			}
+			tmpKey.SetUint(u)
 			return nil
 		}
 	case reflect.String:
-		// TODO: fast, zero-alloc path.
 		keyer = func(b []byte) error {
-			*(*string)(tmpKeyPtr) = string(b)
+			// Always allocate a new string here, since strings use a reference
+			// backing array too.
+			*(*string)(tmpKeyPtr) = *(*string)(unsafe.Pointer(&b))
 			return nil
 		}
 	default:
@@ -717,16 +721,16 @@ func (tx *Transaction) getMap(
 	return errors.New("tx does not implement ManualIterator or OrderedIterator")
 }
 
-// reusableKey describes a buffer where keys are appended into a single,
-// reusable buffer.
-type keybuf struct {
+// keyArena describes a buffer where keys are appended into a single, reusable
+// buffer.
+type keyArena struct {
 	buffer []byte
 }
 
 // append appends data into the given dst byte slice. The dst byte slice's
 // backing must share with buffer, and the data up to buffer's length must not
 // be changed.
-func (kb *keybuf) append(dst, data []byte) []byte {
+func (kb *keyArena) append(dst, data []byte) []byte {
 	newBuf, _ := kb.appendExtra(dst, data, 0)
 	return newBuf
 }
@@ -734,69 +738,63 @@ func (kb *keybuf) append(dst, data []byte) []byte {
 // appendExtra appends data into dst while reserving the extra few bytes at the
 // end right after data without any separators. If data is nil, then the
 // delimiter is right on the left of the extra slice.
-func (kb *keybuf) appendExtra(dst, data []byte, extra int) (newBuf, extraBuf []byte) {
-	newBuf, extraBuf = appendKey(&dst, data, extra, 0)
-
-	if &kb.buffer[0] != &newBuf[0] {
-		// Slice is grown; update the backing array.
-		kb.buffer = newBuf[:len(kb.buffer)]
-	}
-
-	return newBuf, extraBuf
+func (kb *keyArena) appendExtra(dst, data []byte, extra int) (newBuf, extraBuf []byte) {
+	return appendArena(&kb.buffer, dst, data, extra)
 }
 
-// appendPadded is similar to appendExtra, except data is never appended, and
-// newBuf does not contain the padded bytes..
-func (kb *keybuf) appendPadded(dst []byte, padded int) (newBuf, paddedBuf []byte) {
-	newBuf, paddedBuf = appendKey(&dst, nil, 0, padded)
-
-	if &kb.buffer[0] != &newBuf[0] {
-		// Slice is grown; update the backing array.
-		kb.buffer = newBuf[:len(kb.buffer)]
+// avoidOverflow reallocates the whole key slice if it detects that the new
+// size is over the promised size.
+func (kb *keyArena) avoidOverflow(key []byte, promised int) []byte {
+	if len(key) > promised {
+		return append([]byte(nil), key...)
 	}
 
-	return newBuf, paddedBuf
+	// See how many bytes we can save by rewinding the backing array.
+	excess := promised - len(key)
+	kb.buffer = kb.buffer[:len(kb.buffer)-excess]
+	return key
 }
 
-// appendKey appends into the given buffer the key that's separated by the
+// appendArena appends into the given buffer the key that's separated by the
 // separator. If extra is not 0, then an additional region at the end of the
 // buffer is reserved into the extra slice.
-func appendKey(buf *[]byte, k []byte, extra, padded int) (newBuf, otherBuf []byte) {
-	bufHeader := *buf
+func appendArena(backing *[]byte, head, tail []byte, extra int) (newBuf, otherBuf []byte) {
+	backingEnd := len(*backing) + len(head) + len(tail) + len(Separator) + extra
+	if cap(*backing) < backingEnd {
+		// Existing key slice is not enough, so allocate a new one that's
+		// quadruple the length. It is probably better to utilize Go's slice
+		// classes here, but who cares.
+		new := make([]byte, backingEnd*4)
+		start := copy(new, *backing)
 
-	// Don't write k if it's nil and padded > 0.
-	hasK := k != nil || padded == 0
+		end := start
+		end += copy(new[end:], head)
+		end += copy(new[end:], Separator)
+		end += copy(new[end:], tail)
 
-	if min := len(bufHeader) + len(k) + len(Separator) + extra + padded; cap(bufHeader) < min {
-		// Existing key slice is not enough, so allocate a new one.
-		bufHeader = make([]byte, min)
+		newBuf = new[start:end]
 
-		i := 0
-		i += copy(bufHeader[i:], *buf)
-		if hasK {
-			i += copy(bufHeader[i:], Separator)
-			i += copy(bufHeader[i:], k)
-		}
+		// Slice the original slice to include the new section, but use the new
+		// backing array.
+		*backing = new[:end]
 
-		bufHeader = bufHeader[:i]
+	} else {
+		// Set newBuf to the tail of the backing array.
+		newBuf = (*backing)[len(*backing):]
 
-		// Set the backing array.
-		*buf = bufHeader[:len(*buf)]
-	} else if hasK {
-		bufHeader = append(bufHeader, Separator...)
-		bufHeader = append(bufHeader, k...)
+		newBuf = append(newBuf, head...)
+		newBuf = append(newBuf, Separator...)
+		newBuf = append(newBuf, tail...)
+
+		// Slice the original slice to include the new section.
+		*backing = (*backing)[:backingEnd]
 	}
 
-	if padded > 0 {
-		return bufHeader, bufHeader[len(bufHeader) : len(bufHeader)+padded]
+	if extra == 0 {
+		return newBuf, nil
 	}
 
-	if extra > 0 {
-		end := len(bufHeader) + extra
-		return bufHeader[:end], bufHeader[len(bufHeader):end]
-	}
-
-	return bufHeader, nil
+	return newBuf, newBuf[len(newBuf) : len(newBuf)+extra]
 }
 
 // Database describes a database that's managed by kvpack. A database is safe to
