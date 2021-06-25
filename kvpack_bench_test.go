@@ -46,16 +46,18 @@ func BenchmarkPutKVPack(b *testing.B) {
 	k := []byte("best_character")
 	v := benchmarkValue
 
-	tx := newTestTx(noopTx{}, "kvpack_test")
-	defer tx.Rollback()
-
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		tx := newTestTx(noopTx{}, "kvpack_test")
+
 		if err := tx.Put(k, &v); err != nil {
 			b.Fatal("failed to put:", err)
 		}
+
+		// Ensure cleanup.
+		tx.Rollback()
 	}
 }
 
@@ -89,19 +91,25 @@ func BenchmarkGetKVPack(b *testing.B) {
 
 	db := newMockTx(nil, 1)
 	tx := newTestTx(db, "kvpack_test")
-	defer tx.Rollback()
 
 	if err := tx.Put(k, benchmarkValue); err != nil {
 		b.Fatal("failed to prep: put:", err)
 	}
 
+	tx.Rollback()
+	db.lock = true
+
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		tx := newTestTx(db, "kvpack_test")
+
 		if err := tx.Get(k, &v); err != nil {
 			b.Fatal("failed to get:", err)
 		}
+
+		tx.Rollback()
 	}
 }
 
@@ -145,15 +153,17 @@ func BenchmarkPutKVPackMap(b *testing.B) {
 	k := []byte("best_character")
 	v := newBenchmarkMapSample()
 
-	tx := newTestTx(noopTx{}, "kvpack_test")
-
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		tx := newTestTx(noopTx{}, "kvpack_test")
+
 		if err := tx.Put(k, &v); err != nil {
 			b.Fatal("failed to put:", err)
 		}
+
+		tx.Rollback()
 	}
 }
 

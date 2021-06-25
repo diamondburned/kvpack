@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -29,15 +30,20 @@ const recursionLimit = 1024
 // deeply. When this happens, an error occurs to prevent running out of memory.
 var ErrTooRecursed = errors.New("kvpack recursed too deep (> 1024)")
 
-// keyPool is a pool of 512KB-or-larger byte slices.
-var keyPool = sync.Pool{
-	New: func() interface{} { return make([]byte, 0, 512*1024) },
-}
+var (
+	// keyPool is a pool of 512KB-or-larger byte slices.
+	keyPool sync.Pool
+)
+
+// stockKeyPoolCap sets the capacity for each new key buffer. This sets the
+// threshold for when appendExtra should just allocate a new slice instead of
+// taking one from the pool.
+const stockKeyPoolCap = 512 * 1024 // 512KB
 
 // Transaction describes a transaction of a database managed by kvpack.
 type Transaction struct {
 	tx driver.Transaction
-	ns []byte
+	ns int
 	kb keyArena
 
 	// lazy contains fields lazily filled.
@@ -52,13 +58,17 @@ type Transaction struct {
 // NewTransaction creates a new transaction from an existing one. This is useful
 // for working around Database's limited APIs.
 func NewTransaction(tx driver.Transaction, namespace string) *Transaction {
-	ns := keyPool.Get().([]byte)
-	ns = append(ns, namespace...)
+	kb, ok := keyPool.Get().([]byte)
+	if !ok {
+		kb = make([]byte, 0, stockKeyPoolCap)
+	}
+
+	kb = append(kb, namespace...)
 
 	return &Transaction{
 		tx: tx,
-		ns: ns,
-		kb: keyArena{buffer: ns},
+		ns: len(namespace),
+		kb: keyArena{keyBuffer: &keyBuffer{buffer: kb}},
 	}
 }
 
@@ -67,14 +77,19 @@ func (tx *Transaction) Commit() error {
 	return tx.tx.Commit()
 }
 
-// Rollback rolls back the transaction.
+// Rollback rolls back the transaction. Use of a transaction after rolling back
+// will cause a panic.
 func (tx *Transaction) Rollback() error {
 	err := tx.tx.Rollback()
 
 	// Put the current byte slice back to the pool and invalidate them in the
 	// transaction. The byte slices inside the pool must have a length of 0.
-	keyPool.Put(tx.ns[:0])
-	tx.ns = nil
+	for ptr := tx.kb.keyBuffer; ptr != nil; ptr = ptr.prev {
+		keyPool.Put(ptr.buffer[:0])
+	}
+
+	// Free the whole linked list mess.
+	tx.kb.keyBuffer = nil
 
 	return err
 }
@@ -84,11 +99,16 @@ func (tx *Transaction) Delete(k []byte) error {
 	return tx.Put(k, nil)
 }
 
+// namespace returns the namespace from the shared buffer.
+func (tx *Transaction) namespace() []byte {
+	return tx.kb.buffer[:tx.ns]
+}
+
 // Put puts the given value into the database ID'd by the given key. If v's type
 // is a value or a pointer to a byte slice or a string, then a fast path is
 // used, and the values are put into the database as-is.
 func (tx *Transaction) Put(k []byte, v interface{}) error {
-	key := tx.kb.append(tx.ns, k)
+	key := tx.kb.append(tx.namespace(), k)
 	if err := tx.tx.DeletePrefix(key); err != nil {
 		return errors.Wrap(err, "failed to override key")
 	}
@@ -213,6 +233,8 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 	mapKey = mapKey[:len(mapKey)-1]
 	defract.WriteInt64LE(lengthValue, length64)
 
+	log.Println("writing length", lengthValue)
+
 	if err := tx.tx.Put(mapKey, lengthValue); err != nil {
 		return errors.Wrap(err, "failed to write slice len")
 	}
@@ -229,9 +251,13 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 		key, extra := tx.kb.appendExtra(k, nil, 30)
 		key = tx.kb.avoidOverflow(strconv.AppendInt(key, i, 10), len(key)+len(extra))
 
+		log.Printf("Length value is now %q", lengthValue)
+
 		if err := tx.putValue(key, underlying, valueKind, elemPtr, rec); err != nil {
 			return errors.Wrapf(err, "index %d", i)
 		}
+
+		log.Printf("Length value is now %q", lengthValue)
 	}
 
 	return nil
@@ -361,7 +387,7 @@ func (tx *Transaction) putMap(
 }
 
 func (tx *Transaction) Get(k []byte, v interface{}) error {
-	return tx.get(tx.kb.append(tx.ns, k), v)
+	return tx.get(tx.kb.append(tx.namespace(), k), v)
 }
 
 // Access is a convenient function around Get that accesses struct or struct
@@ -369,9 +395,9 @@ func (tx *Transaction) Get(k []byte, v interface{}) error {
 // delimited by a period, for example, "raining.Cats.Dogs", where "raining" is
 // the key.
 func (tx *Transaction) Access(fields string, v interface{}) error {
-	key := tx.kb.append(tx.ns, []byte(fields))
+	key := tx.kb.append(tx.namespace(), []byte(fields))
 	// Replace all periods with the right separator.
-	for i := len(tx.ns); i < len(key); i++ {
+	for i := len(tx.namespace()); i < len(key); i++ {
 		if key[i] == '.' {
 			// We know that separator is a single character, which makes this a
 			// lot easier. Had it been more than one, this wouldn't work.
@@ -508,6 +534,9 @@ func (tx *Transaction) getSlice(
 	length64, ok := defract.ReadInt64LE(lenBytes)
 	if !ok {
 		return io.ErrUnexpectedEOF
+	}
+	if length64 < 0 {
+		return fmt.Errorf("length %d (%q) is negative", length64, lenBytes)
 	}
 	if length64 == 0 {
 		return nil
@@ -724,7 +753,26 @@ func (tx *Transaction) getMap(
 // keyArena describes a buffer where keys are appended into a single, reusable
 // buffer.
 type keyArena struct {
+	*keyBuffer
+}
+
+type keyBuffer struct {
 	buffer []byte
+	prev   *keyBuffer
+}
+
+// avoidOverflow reallocates the whole key slice if it detects that the new
+// size is over the promised size.
+func (kb *keyArena) avoidOverflow(key []byte, promised int) []byte {
+	if len(key) > promised {
+		kb.buffer = kb.buffer[:len(kb.buffer)-promised]
+		return append([]byte(nil), key...)
+	}
+
+	// See how many bytes we can save by rewinding the backing array.
+	excess := promised - len(key)
+	kb.buffer = kb.buffer[:len(kb.buffer)-excess]
+	return key
 }
 
 // append appends data into the given dst byte slice. The dst byte slice's
@@ -738,63 +786,72 @@ func (kb *keyArena) append(dst, data []byte) []byte {
 // appendExtra appends data into dst while reserving the extra few bytes at the
 // end right after data without any separators. If data is nil, then the
 // delimiter is right on the left of the extra slice.
-func (kb *keyArena) appendExtra(dst, data []byte, extra int) (newBuf, extraBuf []byte) {
-	return appendArena(&kb.buffer, dst, data, extra)
-}
-
-// avoidOverflow reallocates the whole key slice if it detects that the new
-// size is over the promised size.
-func (kb *keyArena) avoidOverflow(key []byte, promised int) []byte {
-	if len(key) > promised {
-		return append([]byte(nil), key...)
+func (kb *keyArena) appendExtra(head, tail []byte, extra int) (newBuf, extraBuf []byte) {
+	if kb.keyBuffer == nil {
+		panic("use of invalid keyArena (use after Rollback?)")
 	}
 
-	// See how many bytes we can save by rewinding the backing array.
-	excess := promised - len(key)
-	kb.buffer = kb.buffer[:len(kb.buffer)-excess]
-	return key
-}
+	newAppendEnd := len(head) + len(Separator) + len(tail) + extra
+	newBufferEnd := len(kb.buffer) + newAppendEnd
 
-// appendArena appends into the given buffer the key that's separated by the
-// separator. If extra is not 0, then an additional region at the end of the
-// buffer is reserved into the extra slice.
-func appendArena(backing *[]byte, head, tail []byte, extra int) (newBuf, otherBuf []byte) {
-	backingEnd := len(*backing) + len(head) + len(tail) + len(Separator) + extra
-	if cap(*backing) < backingEnd {
-		// Existing key slice is not enough, so allocate a new one that's
-		// quadruple the length. It is probably better to utilize Go's slice
-		// classes here, but who cares.
-		new := make([]byte, backingEnd*4)
-		start := copy(new, *backing)
+	if cap(kb.buffer) < newBufferEnd {
+		// Existing key slice is not enough, so allocate a new one.
+		var new []byte
+		if newAppendEnd < stockKeyPoolCap {
+			b, ok := keyPool.Get().([]byte)
+			if ok {
+				new = b[:newAppendEnd]
+			} else {
+				// Allocate another slice with the same length, because the pool
+				// just happens to be empty.
+				new = make([]byte, newAppendEnd, stockKeyPoolCap)
+			}
+		} else {
+			// Double the size, because the pool size isn't large enough.
+			new = make([]byte, newAppendEnd, newBufferEnd*2)
+		}
 
-		end := start
+		end := 0
 		end += copy(new[end:], head)
 		end += copy(new[end:], Separator)
 		end += copy(new[end:], tail)
 
-		newBuf = new[start:end]
+		// The new slice has the exact length needed minus the extra.
+		newBuf = new[:end]
 
-		// Slice the original slice to include the new section, but use the new
-		// backing array.
-		*backing = new[:end]
+		// Kill the GC. Create a new keyBuffer entry with the "previous" field
+		// pointing to the current one, then set the current one to the new one.
+		old := kb.keyBuffer
+		kb.keyBuffer = &keyBuffer{buffer: new, prev: old}
 
 	} else {
 		// Set newBuf to the tail of the backing array.
-		newBuf = (*backing)[len(*backing):]
+		start := len(kb.buffer)
 
-		newBuf = append(newBuf, head...)
-		newBuf = append(newBuf, Separator...)
-		newBuf = append(newBuf, tail...)
+		kb.buffer = append(kb.buffer, head...)
+		kb.buffer = append(kb.buffer, Separator...)
+		kb.buffer = append(kb.buffer, tail...)
 
-		// Slice the original slice to include the new section.
-		*backing = (*backing)[:backingEnd]
+		// Slice the original slice to include the new section without the extra
+		// part.
+		newBuf = kb.buffer[start:]
+
+		if extra > 0 {
+			// Include the extra allocated parts into the main buffer so the
+			// next call doesn't override it.
+			kb.buffer = kb.buffer[:len(kb.buffer)+extra]
+		}
 	}
 
 	if extra == 0 {
 		return newBuf, nil
 	}
 
-	return newBuf, newBuf[len(newBuf) : len(newBuf)+extra]
+	extraBuf = newBuf[len(newBuf) : len(newBuf)+extra]
+	// Ensure the extra buffer is always zeroed out.
+	defract.ZeroOutBytes(extraBuf)
+
+	return newBuf, extraBuf
 }
 
 // Database describes a database that's managed by kvpack. A database is safe to

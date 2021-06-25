@@ -280,30 +280,40 @@ const zeroesLen = 102400 // 10KB
 // zeroes might just be one of my worst hacks to date.
 var zeroes [zeroesLen]byte
 
+// ZeroOutBytes fills the given bytes buffer's whole backing array with zeroes.
+func ZeroOutBytes(bytes []byte) {
+	// Ensure the whole backing array is accounted for.
+	if cap(bytes) != len(bytes) {
+		bytes = bytes[:cap(bytes)]
+	}
+
+	if copy(bytes, zeroes[:]) < zeroesLen {
+		return
+	}
+
+	// Fill out the rest if copy returns exactly the length of zeroes. We can do
+	// this 8 bytes at a time by using uint64.
+	vec8End := len(bytes) - (len(bytes) % 8)
+	current := zeroesLen
+
+	for current < vec8End {
+		*(*uint64)(unsafe.Pointer(&bytes[current])) = 0
+		current += 8
+	}
+
+	for current < len(bytes) {
+		bytes[current] = 0
+		current++
+	}
+}
+
 // ZeroOut fills the given buffer with zeroes.
 func ZeroOut(ptr unsafe.Pointer, size uintptr) {
 	if ptr == nil {
 		return
 	}
 
-	if copy(unsafe.Slice((*byte)(ptr), size), zeroes[:]) < zeroesLen {
-		return
-	}
-
-	// Fill out the rest if copy returns exactly the length of zeroes. We can do
-	// this 8 bytes at a time by using uint64.
-	vec8End := size - (size % 8)
-	current := uintptr(zeroesLen)
-
-	for current < vec8End {
-		*(*uint64)(unsafe.Add(ptr, current)) = 0
-		current += 8
-	}
-
-	for current < size {
-		*(*byte)(unsafe.Add(ptr, current)) = 0
-		current++
-	}
+	ZeroOutBytes(unsafe.Slice((*byte)(ptr), size))
 }
 
 // IsZero returns true if the data at the given pointer is all zero. The
@@ -547,11 +557,12 @@ func AllocIndirect(typ reflect.Type, ptr unsafe.Pointer) (reflect.Type, unsafe.P
 // SliceInfo returns the backing array pointer and length of the slice at the
 // given pointer.
 func SliceInfo(ptr unsafe.Pointer) (unsafe.Pointer, int, int) {
-	if *(*unsafe.Pointer)(ptr) == nil {
+	h := (*SliceHeader)(ptr)
+	if h.Data == nil {
 		return nil, 0, 0
 	}
 
-	return (*SliceHeader)(ptr).Data, (*SliceHeader)(ptr).Len, (*SliceHeader)(ptr).Cap
+	return h.Data, h.Len, h.Cap
 }
 
 // StringInfo returns the backing array pointer and length of the string at the

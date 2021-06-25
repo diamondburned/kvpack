@@ -2,6 +2,7 @@ package kvpack
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"reflect"
 	"strings"
@@ -16,6 +17,8 @@ type mockTx struct {
 	// use strings, which is slower but easier to test
 	v map[string][]byte
 	t *testing.T
+
+	lock bool
 }
 
 var (
@@ -24,7 +27,7 @@ var (
 )
 
 func newMockTx(t *testing.T, cap int) *mockTx {
-	return &mockTx{make(map[string][]byte, cap), t}
+	return &mockTx{make(map[string][]byte, cap), t, false}
 }
 
 func (tx *mockTx) Commit() error   { return nil }
@@ -45,6 +48,10 @@ func (tx *mockTx) Get(k []byte, fn func([]byte) error) error {
 }
 
 func (tx *mockTx) Put(k, v []byte) error {
+	if tx.lock {
+		return nil
+	}
+
 	tx.v[string(k)] = v
 	return nil
 }
@@ -64,6 +71,10 @@ func (tx *mockTx) IterateUnordered(prefix []byte, fn func(k, v []byte) error) er
 }
 
 func (tx *mockTx) DeletePrefix(prefix []byte) error {
+	if tx.lock {
+		return nil
+	}
+
 	prefixString := string(prefix)
 	for k := range tx.v {
 		if strings.HasPrefix(k, prefixString) {
@@ -121,6 +132,7 @@ func newTestTx(tx driver.Transaction, ns string) *Transaction {
 func TestTransactionStruct(t *testing.T) {
 	type extinct struct {
 		Dinosaurs string // raw bytes
+		Dodo      string // raw bytes
 	}
 
 	type numbers struct {
@@ -158,7 +170,7 @@ func TestTransactionStruct(t *testing.T) {
 	}
 
 	type animals struct {
-		Extinct  extinct
+		Extincts []extinct
 		Cats     string // raw bytes
 		Dogs     string // raw bytes
 		SoTrue   bool   // \x01, omitted if false
@@ -174,8 +186,9 @@ func TestTransactionStruct(t *testing.T) {
 	}
 
 	testValue := animals{
-		Extinct: extinct{
-			Dinosaurs: "???",
+		Extincts: []extinct{
+			{Dinosaurs: "???"},
+			{Dodo: "???"},
 		},
 		Cats:     "meow",
 		Dogs:     "woof",
@@ -256,8 +269,11 @@ func TestTransactionStruct(t *testing.T) {
 			f("Dogs"):   "woof",
 			f("SoTrue"): "\x01",
 
-			f("Extinct"):              "",
-			f("Extinct", "Dinosaurs"): "???",
+			f("Extincts"):                   n(int(2)),
+			f("Extincts", "0"):              "",
+			f("Extincts", "0", "Dinosaurs"): "???",
+			f("Extincts", "1"):              "",
+			f("Extincts", "1", "Dodo"):      "???",
 
 			f("Numbers"):         "",
 			f("Numbers", "Byte"): "\x01",
@@ -389,20 +405,18 @@ func TestAppendKey(t *testing.T) {
 			buf: func() []byte {
 				buf := make([]byte, 128)
 				copy(buf, "hi")
-				// ignore 2
-				// ignore 2 + 1 + 3
-				copy(buf[8:], "lol")
 				return buf[:2]
 			}(),
 			key:    []byte("key"),
 			extra:  3,
-			expect: expect{"hi\x00key", "lol"},
+			expect: expect{"hi\x00key", "\x00\x00\x00"},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			new, extra := appendArena(&test.buf, test.buf, test.key, test.extra)
+			arena := keyArena{&keyBuffer{buffer: test.buf}}
+			new, extra := arena.appendExtra(test.buf, test.key, test.extra)
 			if string(test.expect.key) != string(new) {
 				t.Fatalf("key expected %q, got %q", test.expect.key, new)
 			}
@@ -411,4 +425,30 @@ func TestAppendKey(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("user1", func(t *testing.T) {
+		// no alloc test
+		arena := keyArena{&keyBuffer{buffer: make([]byte, 0, 10240)}}
+		arena.buffer = append(arena.buffer, "prefix"...)
+
+		for i := 0; i < 4; i++ {
+			key, extra := arena.appendExtra(arena.buffer[:6], []byte("tail"), 10)
+			key = arena.avoidOverflow(append(key, "testtest"...), len(key)+len(extra))
+		}
+
+		log.Printf("buffer: %q", arena.buffer[:90])
+	})
+
+	t.Run("user1", func(t *testing.T) {
+		// no alloc test
+		arena := keyArena{&keyBuffer{buffer: make([]byte, 0, 10240)}}
+		arena.buffer = append(arena.buffer, "prefix"...)
+
+		for i := 0; i < 4; i++ {
+			_, extra := arena.appendExtra(arena.buffer[:6], nil, 10)
+			copy(extra, "testtest")
+		}
+
+		log.Printf("buffer: %q", arena.buffer[:90])
+	})
 }
