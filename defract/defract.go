@@ -280,14 +280,9 @@ const zeroesLen = 102400 // 10KB
 // zeroes might just be one of my worst hacks to date.
 var zeroes [zeroesLen]byte
 
-// ZeroOutBytes fills the given bytes buffer's whole backing array with zeroes.
+// ZeroOutBytes fills the given bytes slice with zeroes.
 func ZeroOutBytes(bytes []byte) {
-	// Ensure the whole backing array is accounted for.
-	if cap(bytes) != len(bytes) {
-		bytes = bytes[:cap(bytes)]
-	}
-
-	if copy(bytes, zeroes[:]) < zeroesLen {
+	if copy(bytes, zeroes[:]) <= zeroesLen {
 		return
 	}
 
@@ -613,4 +608,15 @@ func CopyString(dst unsafe.Pointer, src []byte) {
 
 	// Reallocate the string the normal way.
 	*(*string)(dst) = string(src)
+}
+
+// WithinBytes returns true if the inner slice is within outer slice.
+func WithinBytes(outer, inner []byte) bool {
+	outerStart, _, outerCap := SliceInfo(unsafe.Pointer(&outer))
+	outerEnd := unsafe.Add(outerStart, outerCap)
+
+	innerStart, _, innerCap := SliceInfo(unsafe.Pointer(&inner))
+	innerEnd := unsafe.Add(innerStart, innerCap)
+
+	return uintptr(outerStart) <= uintptr(innerStart) && uintptr(innerEnd) <= uintptr(outerEnd)
 }

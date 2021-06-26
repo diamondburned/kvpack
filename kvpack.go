@@ -4,15 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log"
 	"reflect"
 	"runtime"
 	"strconv"
-	"sync"
 	"unsafe"
 
 	"github.com/diamondburned/kvpack/defract"
 	"github.com/diamondburned/kvpack/driver"
+	"github.com/diamondburned/kvpack/internal/key"
 	"github.com/pkg/errors"
 )
 
@@ -30,85 +29,80 @@ const recursionLimit = 1024
 // deeply. When this happens, an error occurs to prevent running out of memory.
 var ErrTooRecursed = errors.New("kvpack recursed too deep (> 1024)")
 
-var (
-	// keyPool is a pool of 512KB-or-larger byte slices.
-	keyPool sync.Pool
-)
-
-// stockKeyPoolCap sets the capacity for each new key buffer. This sets the
-// threshold for when appendExtra should just allocate a new slice instead of
-// taking one from the pool.
-const stockKeyPoolCap = 512 * 1024 // 512KB
+// ErrReadOnly is returned if the transaction is read-only but a write action is
+// being performed.
+var ErrReadOnly = errors.New("transaction is read-only")
 
 // Transaction describes a transaction of a database managed by kvpack.
 type Transaction struct {
 	tx driver.Transaction
 	ns int
-	kb keyArena
-
-	// lazy contains fields lazily filled.
-	lazy struct {
-		orderedIter   driver.OrderedIterator
-		orderedIterOk bool
-		manualIter    driver.UnorderedIterator
-		manualIterOk  bool
-	}
+	kb key.Arena
+	ro bool
 }
 
 // NewTransaction creates a new transaction from an existing one. This is useful
 // for working around Database's limited APIs.
-func NewTransaction(tx driver.Transaction, namespace string) *Transaction {
-	kb, ok := keyPool.Get().([]byte)
-	if !ok {
-		kb = make([]byte, 0, stockKeyPoolCap)
-	}
-
-	kb = append(kb, namespace...)
+func NewTransaction(tx driver.Transaction, namespace string, ro bool) *Transaction {
+	kb := key.TakeArena(Separator)
+	kb.Buffer = append(kb.Buffer, namespace...)
 
 	return &Transaction{
 		tx: tx,
 		ns: len(namespace),
-		kb: keyArena{keyBuffer: &keyBuffer{buffer: kb}},
+		kb: kb,
+		ro: ro,
 	}
 }
 
 // Commit commits the transaction.
 func (tx *Transaction) Commit() error {
-	return tx.tx.Commit()
+	if tx.ro {
+		tx.Rollback()
+		return ErrReadOnly
+	}
+
+	if err := tx.tx.Commit(); err != nil {
+		tx.Rollback()
+		return errors.Wrap(err, "failed to rollback")
+	}
+
+	// Always rollback to ensure we properly repool resources as well as
+	// cleaning up the resources.
+	return tx.Rollback()
 }
 
 // Rollback rolls back the transaction. Use of a transaction after rolling back
 // will cause a panic.
 func (tx *Transaction) Rollback() error {
 	err := tx.tx.Rollback()
-
-	// Put the current byte slice back to the pool and invalidate them in the
-	// transaction. The byte slices inside the pool must have a length of 0.
-	for ptr := tx.kb.keyBuffer; ptr != nil; ptr = ptr.prev {
-		keyPool.Put(ptr.buffer[:0])
-	}
-
-	// Free the whole linked list mess.
-	tx.kb.keyBuffer = nil
-
+	tx.kb.Put()
 	return err
 }
 
 // Delete deletes the value with the given key.
 func (tx *Transaction) Delete(k []byte) error {
+	if tx.ro {
+		return ErrReadOnly
+	}
+
 	return tx.Put(k, nil)
 }
 
 // namespace returns the namespace from the shared buffer.
 func (tx *Transaction) namespace() []byte {
-	return tx.kb.buffer[:tx.ns]
+	return tx.kb.Buffer[:tx.ns]
 }
 
 // Put puts the given value into the database ID'd by the given key. If v's type
 // is a value or a pointer to a byte slice or a string, then a fast path is
 // used, and the values are put into the database as-is.
 func (tx *Transaction) Put(k []byte, v interface{}) error {
-	key := tx.kb.append(tx.namespace(), k)
+	if tx.ro {
+		return ErrReadOnly
+	}
+
+	key := tx.kb.Append(tx.namespace(), k)
 	if err := tx.tx.DeletePrefix(key); err != nil {
 		return errors.Wrap(err, "failed to override key")
 	}
@@ -229,11 +223,9 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 	length64 := int64(length)
 
 	// Write the slice length conveniently into the same buffer as the key.
-	mapKey, lengthValue := tx.kb.appendExtra(k, nil, 8)
+	mapKey, lengthValue := tx.kb.AppendExtra(k, nil, 8)
 	mapKey = mapKey[:len(mapKey)-1]
 	defract.WriteInt64LE(lengthValue, length64)
-
-	log.Println("writing length", lengthValue)
 
 	if err := tx.tx.Put(mapKey, lengthValue); err != nil {
 		return errors.Wrap(err, "failed to write slice len")
@@ -248,16 +240,12 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 			continue
 		}
 
-		key, extra := tx.kb.appendExtra(k, nil, 30)
-		key = tx.kb.avoidOverflow(strconv.AppendInt(key, i, 10), len(key)+len(extra))
-
-		log.Printf("Length value is now %q", lengthValue)
+		key, extra := tx.kb.AppendExtra(k, nil, 30)
+		key = tx.kb.AvoidOverflow(strconv.AppendInt(key, i, 10), len(key)+len(extra))
 
 		if err := tx.putValue(key, underlying, valueKind, elemPtr, rec); err != nil {
 			return errors.Wrapf(err, "index %d", i)
 		}
-
-		log.Printf("Length value is now %q", lengthValue)
 	}
 
 	return nil
@@ -284,7 +272,7 @@ func (tx *Transaction) putStruct(
 			continue
 		}
 
-		key := tx.kb.append(k, field.Name)
+		key := tx.kb.Append(k, field.Name)
 
 		if field.ChildStruct != nil {
 			if field.Indirect {
@@ -325,27 +313,27 @@ func (tx *Transaction) putMap(
 	switch kind := keyType.Kind(); kind {
 	case reflect.Float32, reflect.Float64:
 		keyer = func(v reflect.Value) []byte {
-			key, extra := tx.kb.appendExtra(k, nil, 300)
+			key, extra := tx.kb.AppendExtra(k, nil, 300)
 
-			return tx.kb.avoidOverflow(
+			return tx.kb.AvoidOverflow(
 				strconv.AppendFloat(key, v.Float(), 'f', -1, 64),
 				len(key)+len(extra),
 			)
 		}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		keyer = func(v reflect.Value) []byte {
-			key, extra := tx.kb.appendExtra(k, nil, 20)
+			key, extra := tx.kb.AppendExtra(k, nil, 20)
 
-			return tx.kb.avoidOverflow(
+			return tx.kb.AvoidOverflow(
 				strconv.AppendInt(key, v.Int(), 10),
 				len(key)+len(extra),
 			)
 		}
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		keyer = func(v reflect.Value) []byte {
-			key, extra := tx.kb.appendExtra(k, nil, 20)
+			key, extra := tx.kb.AppendExtra(k, nil, 20)
 
-			return tx.kb.avoidOverflow(
+			return tx.kb.AvoidOverflow(
 				strconv.AppendUint(key, v.Uint(), 10),
 				len(key)+len(extra),
 			)
@@ -353,7 +341,7 @@ func (tx *Transaction) putMap(
 	case reflect.String:
 		keyer = func(v reflect.Value) []byte {
 			data, len := defract.StringInfo(defract.InterfacePtr(v.Interface()))
-			return tx.kb.append(k, unsafe.Slice((*byte)(data), len))
+			return tx.kb.Append(k, unsafe.Slice((*byte)(data), len))
 		}
 	default:
 		return fmt.Errorf("unsupported key type %s", keyType)
@@ -387,7 +375,7 @@ func (tx *Transaction) putMap(
 }
 
 func (tx *Transaction) Get(k []byte, v interface{}) error {
-	return tx.get(tx.kb.append(tx.namespace(), k), v)
+	return tx.get(tx.kb.Append(tx.namespace(), k), v)
 }
 
 // Access is a convenient function around Get that accesses struct or struct
@@ -395,7 +383,7 @@ func (tx *Transaction) Get(k []byte, v interface{}) error {
 // delimited by a period, for example, "raining.Cats.Dogs", where "raining" is
 // the key.
 func (tx *Transaction) Access(fields string, v interface{}) error {
-	key := tx.kb.append(tx.namespace(), []byte(fields))
+	key := tx.kb.Append(tx.namespace(), []byte(fields))
 	// Replace all periods with the right separator.
 	for i := len(tx.namespace()); i < len(key); i++ {
 		if key[i] == '.' {
@@ -513,17 +501,6 @@ func (tx *Transaction) getValueBytes(
 	return fmt.Errorf("unknown type %s", typ)
 }
 
-// orderedIterator returns a non-nil OrderedIterator if the transaction supports
-// it.
-func (tx *Transaction) orderedIterator() driver.OrderedIterator {
-	if !tx.lazy.orderedIterOk {
-		tx.lazy.orderedIter, _ = tx.tx.(driver.OrderedIterator)
-		tx.lazy.orderedIterOk = true
-	}
-
-	return tx.lazy.orderedIter
-}
-
 func (tx *Transaction) getSlice(
 	k, lenBytes []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
 
@@ -554,40 +531,26 @@ func (tx *Transaction) getSlice(
 
 	dataPtr := defract.SliceSetLen(ptr, length64)
 
-	if iter := tx.orderedIterator(); iter != nil {
-		// Make a new key with the trailing separator so the length doesn't get
-		// included.
-		prefix := tx.kb.append(k, nil)
+	// Make a new key with the trailing separator so the length doesn't get
+	// included.
+	prefix := tx.kb.Append(k, nil)
 
-		return iter.OrderedIterate(prefix, func(k, v []byte) error {
-			// Trim the key and parse the index.
-			ixBytes := bytes.TrimPrefix(k, prefix)
+	return tx.tx.Iterate(prefix, func(k, v []byte) error {
+		// Trim the key, split the delimiters and parse the index.
+		keyTail := bytes.TrimPrefix(k, prefix)
+		ixBytes := bytes.SplitN(keyTail, []byte(Separator), 2)[0]
 
-			i, err := strconv.ParseInt(defract.BytesToStr(ixBytes), 10, 64)
-			if err != nil {
-				return errors.Wrap(err, "ix failed")
-			}
-			if i < 0 || i >= length64 {
-				return errors.New("ix overflow")
-			}
-
-			elemPtr := unsafe.Add(dataPtr, int64(valueSize)*i)
-			return tx.getValueBytes(k, v, underlying, valueKind, elemPtr, rec+1)
-		})
-	}
-
-	for i := int64(0); i < length64; i++ {
-		k, extra := tx.kb.appendExtra(k, nil, 20)
-		k = tx.kb.avoidOverflow(strconv.AppendInt(k, i, 10), len(k)+len(extra))
+		i, err := strconv.ParseInt(defract.BytesToStr(ixBytes), 10, 64)
+		if err != nil {
+			return errors.Wrap(err, "ix failed")
+		}
+		if i < 0 || i >= length64 {
+			return errors.New("ix overflow")
+		}
 
 		elemPtr := unsafe.Add(dataPtr, int64(valueSize)*i)
-
-		if err := tx.getValue(k, underlying, valueKind, elemPtr, rec+1); err != nil {
-			return errors.Wrapf(err, "index %d", i)
-		}
-	}
-
-	return nil
+		return tx.getValueBytes(k, v, underlying, valueKind, elemPtr, rec+1)
+	})
 }
 
 func (tx *Transaction) getStruct(
@@ -599,7 +562,7 @@ func (tx *Transaction) getStruct(
 
 	for _, field := range info.Fields {
 		ptr := unsafe.Add(ptr, field.Offset)
-		key := tx.kb.append(k, field.Name)
+		key := tx.kb.Append(k, field.Name)
 
 		if err := tx.getValue(key, field.Type, field.Kind, ptr, rec+1); err != nil {
 			return errors.Wrapf(err, "struct %s field %s", info.Type, field.Name)
@@ -607,17 +570,6 @@ func (tx *Transaction) getStruct(
 	}
 
 	return nil
-}
-
-// manualIterator returns a non-nil UnorderedIterator if the transaction supports
-// it.
-func (tx *Transaction) manualIterator() driver.UnorderedIterator {
-	if !tx.lazy.manualIterOk {
-		tx.lazy.manualIter, _ = tx.tx.(driver.UnorderedIterator)
-		tx.lazy.manualIterOk = true
-	}
-
-	return tx.lazy.manualIter
 }
 
 func (tx *Transaction) getMap(
@@ -717,9 +669,9 @@ func (tx *Transaction) getMap(
 		mapValue = reflect.NewAt(typ, *mapPtr).Elem()
 	}
 
-	dbPrefix := tx.kb.append(k, nil)
+	dbPrefix := tx.kb.Append(k, nil)
 
-	onValue := func(k, v []byte) error {
+	return tx.tx.Iterate(dbPrefix, func(k, v []byte) error {
 		mapKey := k[len(dbPrefix):]
 		if err := keyer(mapKey); err != nil {
 			return errors.Wrapf(err, "key error at key %q", mapKey)
@@ -737,128 +689,14 @@ func (tx *Transaction) getMap(
 
 		mapValue.SetMapIndex(tmpKey, tmpValue.Elem())
 		return nil
-	}
-
-	if iterator := tx.manualIterator(); iterator != nil {
-		return iterator.IterateUnordered(dbPrefix, onValue)
-	}
-
-	if iterator := tx.orderedIterator(); iterator != nil {
-		return iterator.OrderedIterate(dbPrefix, onValue)
-	}
-
-	return errors.New("tx does not implement ManualIterator or OrderedIterator")
-}
-
-// keyArena describes a buffer where keys are appended into a single, reusable
-// buffer.
-type keyArena struct {
-	*keyBuffer
-}
-
-type keyBuffer struct {
-	buffer []byte
-	prev   *keyBuffer
-}
-
-// avoidOverflow reallocates the whole key slice if it detects that the new
-// size is over the promised size.
-func (kb *keyArena) avoidOverflow(key []byte, promised int) []byte {
-	if len(key) > promised {
-		kb.buffer = kb.buffer[:len(kb.buffer)-promised]
-		return append([]byte(nil), key...)
-	}
-
-	// See how many bytes we can save by rewinding the backing array.
-	excess := promised - len(key)
-	kb.buffer = kb.buffer[:len(kb.buffer)-excess]
-	return key
-}
-
-// append appends data into the given dst byte slice. The dst byte slice's
-// backing must share with buffer, and the data up to buffer's length must not
-// be changed.
-func (kb *keyArena) append(dst, data []byte) []byte {
-	newBuf, _ := kb.appendExtra(dst, data, 0)
-	return newBuf
-}
-
-// appendExtra appends data into dst while reserving the extra few bytes at the
-// end right after data without any separators. If data is nil, then the
-// delimiter is right on the left of the extra slice.
-func (kb *keyArena) appendExtra(head, tail []byte, extra int) (newBuf, extraBuf []byte) {
-	if kb.keyBuffer == nil {
-		panic("use of invalid keyArena (use after Rollback?)")
-	}
-
-	newAppendEnd := len(head) + len(Separator) + len(tail) + extra
-	newBufferEnd := len(kb.buffer) + newAppendEnd
-
-	if cap(kb.buffer) < newBufferEnd {
-		// Existing key slice is not enough, so allocate a new one.
-		var new []byte
-		if newAppendEnd < stockKeyPoolCap {
-			b, ok := keyPool.Get().([]byte)
-			if ok {
-				new = b[:newAppendEnd]
-			} else {
-				// Allocate another slice with the same length, because the pool
-				// just happens to be empty.
-				new = make([]byte, newAppendEnd, stockKeyPoolCap)
-			}
-		} else {
-			// Double the size, because the pool size isn't large enough.
-			new = make([]byte, newAppendEnd, newBufferEnd*2)
-		}
-
-		end := 0
-		end += copy(new[end:], head)
-		end += copy(new[end:], Separator)
-		end += copy(new[end:], tail)
-
-		// The new slice has the exact length needed minus the extra.
-		newBuf = new[:end]
-
-		// Kill the GC. Create a new keyBuffer entry with the "previous" field
-		// pointing to the current one, then set the current one to the new one.
-		old := kb.keyBuffer
-		kb.keyBuffer = &keyBuffer{buffer: new, prev: old}
-
-	} else {
-		// Set newBuf to the tail of the backing array.
-		start := len(kb.buffer)
-
-		kb.buffer = append(kb.buffer, head...)
-		kb.buffer = append(kb.buffer, Separator...)
-		kb.buffer = append(kb.buffer, tail...)
-
-		// Slice the original slice to include the new section without the extra
-		// part.
-		newBuf = kb.buffer[start:]
-
-		if extra > 0 {
-			// Include the extra allocated parts into the main buffer so the
-			// next call doesn't override it.
-			kb.buffer = kb.buffer[:len(kb.buffer)+extra]
-		}
-	}
-
-	if extra == 0 {
-		return newBuf, nil
-	}
-
-	extraBuf = newBuf[len(newBuf) : len(newBuf)+extra]
-	// Ensure the extra buffer is always zeroed out.
-	defract.ZeroOutBytes(extraBuf)
-
-	return newBuf, extraBuf
+	})
 }
 
 // Database describes a database that's managed by kvpack. A database is safe to
 // use concurrently.
 type Database struct {
-	db driver.Database
-	ns string
+	driver.Database
+	namespace string
 }
 
 // NewDatabase creates a new database from an existing database instance. The
@@ -866,32 +704,102 @@ type Database struct {
 // useful for separating database instances.
 func NewDatabase(db driver.Database, namespace string) *Database {
 	return &Database{
-		db: db,
-		ns: Namespace + Separator + namespace,
+		Database:  db,
+		namespace: Namespace + Separator + namespace,
 	}
 }
 
 // Begin starts a transaction.
-func (db *Database) Begin() (*Transaction, error) {
-	tx, err := db.db.Begin()
+func (db *Database) Begin(readOnly bool) (*Transaction, error) {
+	tx, err := db.Database.Begin(readOnly)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewTransaction(tx, db.ns), nil
+	return NewTransaction(tx, db.namespace, readOnly), nil
 }
 
-// Put puts the given value into the database with the key in a single
-// transaction.
-func (db *Database) Put(k []byte, v interface{}) error {
-	tx, err := db.Begin()
+// View opens a read-only transaction and runs the given function with that
+// opened transaction, then cleans it up.
+func (db *Database) View(f func(*Transaction) error) error {
+	tx, err := db.Begin(true)
+	if err != nil {
+		return err
+	}
+
+	if err := f(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	return tx.Rollback()
+}
+
+// Update opens a read-write transaction and runs the given function with that
+// opened transaction, then commits the transaction.
+func (db *Database) Update(f func(*Transaction) error) error {
+	tx, err := db.Begin(false)
+	if err != nil {
+		return err
+	}
+
+	if err := f(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// Access gets the given dot-syntax key and unmarshals its value into the given
+// pointer in a single read-only transaction. For more information, see
+// Transaction's Access.
+func (db *Database) Access(k string, v interface{}) error {
+	tx, err := db.Begin(true)
 	if err != nil {
 		return errors.Wrap(err, "failed to start transaction")
 	}
 	defer tx.Rollback()
 
+	if err := tx.Access(k, v); err != nil {
+		return errors.Wrap(err, "failed to get")
+	}
+
+	return nil
+}
+
+// Get gets the given key and unmarshals its value into the given pointer in a
+// single read-only transaction.
+func (db *Database) Get(k []byte, v interface{}) error {
+	tx, err := db.Begin(true)
+	if err != nil {
+		return errors.Wrap(err, "failed to start transaction")
+	}
+	defer tx.Rollback()
+
+	if err := tx.Get(k, v); err != nil {
+		return errors.Wrap(err, "failed to get")
+	}
+
+	return nil
+}
+
+// Put puts the given value into the database with the key in a single
+// transaction.
+func (db *Database) Put(k []byte, v interface{}) error {
+	tx, err := db.Begin(false)
+	if err != nil {
+		return errors.Wrap(err, "failed to start transaction")
+	}
+	defer tx.Rollback()
+
+	if err := tx.Put(k, v); err != nil {
+		return errors.Wrap(err, "failed to put")
+	}
+
 	if err := tx.Commit(); err != nil {
 		return errors.Wrap(err, "failed to commit")
 	}
+
 	return nil
 }

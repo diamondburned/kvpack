@@ -99,8 +99,8 @@ func TestIsZero(t *testing.T) {
 
 	t.Run("1024", func(t *testing.T) { testWithSize(t, 1024, 1) })
 	t.Run("4096", func(t *testing.T) { testWithSize(t, 4096, 1) })
-	t.Run("1024000_1", func(t *testing.T) { testWithSize(t, 1024000, 1) })
-	t.Run("1024000_2", func(t *testing.T) { testWithSize(t, 1024000, 1024000/4) })
+	t.Run("1024000_end", func(t *testing.T) { testWithSize(t, 1024000, 1) })
+	t.Run("1024000_start", func(t *testing.T) { testWithSize(t, 1024000, 1024000/4) })
 }
 
 func TestIsLittleEndian(t *testing.T) {
@@ -124,14 +124,29 @@ func TestIsLittleEndian(t *testing.T) {
 			if !IsLittleEndian {
 				t.Fatal("not little endian")
 			}
+			return
 		case "Big Endian":
 			if IsLittleEndian {
 				t.Fatal("not big endian")
 			}
+			return
 		default:
 			t.Skip("unknown Byte Order value", string(lastTwo))
 		}
 	}
 
 	t.Skip("unrecognized lscpu output")
+}
+
+func TestWithinSlice(t *testing.T) {
+	outer := make([]byte, 0, 50)
+	inner := outer[2:34]
+
+	if !WithinBytes(outer, inner) {
+		t.Fatal("unexpected outer/inner result")
+	}
+
+	if WithinBytes(outer, make([]byte, 0, 10)) {
+		t.Fatal("new slice is incorrectly within outer")
+	}
 }
