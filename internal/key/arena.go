@@ -48,8 +48,8 @@ func (a *Arena) Put() {
 }
 
 type keyBuffer struct {
-	Buffer []byte
 	prev   *keyBuffer
+	Buffer []byte
 }
 
 // AvoidOverflow reallocates the whole key slice if it detects that the new

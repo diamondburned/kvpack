@@ -366,15 +366,17 @@ type StructInfo struct {
 }
 
 type StructField struct {
-	Name   []byte
-	Type   reflect.Type
-	Kind   reflect.Kind
-	Size   uintptr
-	Offset uintptr
+	Type reflect.Type
 
 	// ChildStruct is provided if this field is of type struct. If the type
 	// matches exactly the parent, then the same pointer is set.
 	ChildStruct *StructInfo
+
+	Name   []byte
+	Kind   reflect.Kind
+	Size   uintptr
+	Offset uintptr
+
 	// Indirect is true if the type is pointer.
 	Indirect bool
 }

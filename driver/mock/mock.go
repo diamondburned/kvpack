@@ -5,27 +5,27 @@ import (
 	"errors"
 	"strings"
 	"sync"
-	"testing"
 
 	"github.com/diamondburned/kvpack"
 	"github.com/diamondburned/kvpack/driver"
 )
 
-
 // Database is thread-safe.
 type Database struct {
 	m sync.RWMutex
-	n string
 	v map[string]string
 }
 
 // NewDatabase makes a new empty database. If a namespace is provided, then
 // Expect will use that namespace.
 func NewDatabase(expectNamespace string) *kvpack.Database {
-	return kvpack.NewDatabase(&Database{
-		n: expectNamespace,
+	return kvpack.NewDatabase(newDatabase(), expectNamespace)
+}
+
+func newDatabase() *Database {
+	return &Database{
 		v: make(map[string]string),
-	}, expectNamespace)
+	}
 }
 
 // Begin starts a transaction.
@@ -38,57 +38,6 @@ func (db *Database) Begin(ro bool) (driver.Transaction, error) {
 		tmp: make([]kvPair, 0, 128),
 		db:  db,
 	}, nil
-}
-
-// Expect calls the Expect method of the mock database. If the kvpack database
-// doesn't contain the mock database, then it panics.
-func Expect(db *kvpack.Database, t *testing.T, key string, o map[string]string) {
-	mockDB := db.Database.(*Database)
-	mockDB.Expect(t, key, o)
-}
-
-// Expect verifies that the database contains the given data in the o map.
-func (db *Database) Expect(t *testing.T, key string, o map[string]string) {
-	if db.n == "" {
-		t.Error("expectNamespace not given")
-		return
-	}
-
-	makeFullKey := func(k string) string {
-		if k != "" {
-			k = kvpack.Separator + strings.ReplaceAll(k, ".", kvpack.Separator)
-		}
-
-		return string(kvpack.Namespace + kvpack.Separator + db.n + kvpack.Separator + key + k)
-	}
-
-	// Copy all the keys so we can keep track of which one is found.
-	keys := make(map[string]struct{}, len(db.v))
-	for k := range db.v {
-		keys[k] = struct{}{}
-	}
-
-	for k, v := range o {
-		fullKey := makeFullKey(k)
-
-		got, ok := db.v[fullKey]
-		if !ok {
-			t.Errorf("missing key %q value %q", fullKey, v)
-			continue
-		}
-
-		if string(got) != v {
-			t.Errorf("key %q value expected %q, got %q", fullKey, v, got)
-			continue
-		}
-
-		delete(keys, fullKey)
-		delete(o, k)
-	}
-
-	for k := range keys {
-		t.Errorf("excess key %q value %q", k, db.v[k])
-	}
 }
 
 // Transaction is not thread-safe.
@@ -187,8 +136,6 @@ func (tx *Transaction) Put(k, v []byte) error {
 // Iterate iterates over both the uncommitted transaction store and the
 // committed database region.
 func (tx *Transaction) Iterate(prefix []byte, fn func(k, v []byte) error) error {
-	prefixString := string(prefix)
-
 	for _, pair := range tx.tmp {
 		if bytes.HasPrefix(pair[0], prefix) {
 			if err := fn(pair[0], pair[1]); err != nil {
@@ -196,6 +143,8 @@ func (tx *Transaction) Iterate(prefix []byte, fn func(k, v []byte) error) error 
 			}
 		}
 	}
+
+	prefixString := string(prefix)
 
 	tx.db.m.RLock()
 	defer tx.db.m.RUnlock()
