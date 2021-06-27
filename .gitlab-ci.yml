@@ -14,14 +14,14 @@
   ],
   "unit_test": {
     "stage": "test",
-    "timeout": "15s",
+    "timeout": "1m",
     "script": [
       "go test -race -gcflags=all=-d=checkptr ./..."
     ]
   },
   "coverage": {
     "stage": "test",
-    "timeout": "15s",
+    "timeout": "1m",
     "script": [
       "go test -coverprofile=$COV -coverpkg=. -bench=. -benchtime=25ms ./...",
       "go tool cover -func $COV"
@@ -29,7 +29,7 @@
   },
   "benchmark": {
     "stage": "benchmark",
-    "timeout": "1m",
+    "timeout": "2m",
     "script": [
       "go test ./... -bench=."
     ]
