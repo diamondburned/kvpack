@@ -2,6 +2,7 @@
 package tests
 
 import (
+	"errors"
 	"math"
 	"reflect"
 	"strings"
@@ -33,6 +34,7 @@ runTest:
 		t.Run("value", s.testPutValue)
 	})
 	t.Run("Get", s.testGet)
+	t.Run("Delete", s.testDelete)
 
 	// Run the test twice if we're on a Little-Endian machine.
 	if defract.IsLittleEndian {
@@ -163,8 +165,9 @@ func newTestValue() animals {
 func (s suite) testPutPtr(t *testing.T) {
 	testValue := newTestValue()
 
+	// Test db.Put.
 	if err := s.db.Put([]byte("put_ptr"), &testValue); err != nil {
-		t.Error("failed to put &testValue:", err)
+		t.Error("failed to put &testValue using db.Put:", err)
 	}
 	s.testExpect(t, "put_ptr")
 }
@@ -172,8 +175,11 @@ func (s suite) testPutPtr(t *testing.T) {
 func (s suite) testPutValue(t *testing.T) {
 	testValue := newTestValue()
 
-	if err := s.db.Put([]byte("put_value"), testValue); err != nil {
-		t.Error("failed to put testValue:", err)
+	// Test db.Update.
+	if err := s.db.Update(func(tx *kvpack.Transaction) error {
+		return tx.Put([]byte("put_value"), testValue)
+	}); err != nil {
+		t.Error("failed to put testValue using db.Update:", err)
 	}
 	s.testExpect(t, "put_value")
 }
@@ -297,6 +303,70 @@ func (s suite) testGet(t *testing.T) {
 	accessAssert("put_ptr.MoreNums.2", &nthNum1, &expectNthNum)
 	var nthNum2 int
 	accessAssert("put_value.MoreNums.2", &nthNum2, &expectNthNum)
+
+	var catOutput1 string
+	accessAssert("put_ptr.Cats", &catOutput1, &expect.Cats)
+	var catOutput2 string
+	accessAssert("put_value.Cats", &catOutput2, &expect.Cats)
+
+	toBytesPtr := func(s string) *[]byte {
+		v := []byte(s)
+		return &v
+	}
+	var catOutput3 []byte
+	accessAssert("put_ptr.Cats", &catOutput3, toBytesPtr(expect.Cats))
+	var catOutput4 []byte
+	accessAssert("put_value.Cats", &catOutput4, toBytesPtr(expect.Cats))
+
+	expectMapPtr := map[string]string{
+		"junk":  "delete me",
+		"hello": "world",
+		"felix": "argyle",
+	}
+	outputMapPtr1 := map[string]string{"junk": "delete me"}
+	accessAssert("put_ptr.Maps.Strs", &outputMapPtr1, &expectMapPtr)
+	outputMapPtr2 := map[string]string{"junk": "delete me"}
+	accessAssert("put_value.Maps.Strs", &outputMapPtr2, &expectMapPtr)
+}
+
+func (s suite) testDelete(t *testing.T) {
+	if err := s.db.Put([]byte("delete_testkey"), []byte("a")); err != nil {
+		t.Fatal("failed to put:", err)
+	}
+
+	var out string
+	if err := s.db.Get([]byte("delete_testkey"), &out); err != nil {
+		t.Fatal("failed to get what's put:", err)
+	}
+
+	if out != "a" {
+		t.Fatalf("unexpected output: %q", out)
+	}
+
+	if err := s.db.Delete([]byte("delete_testkey")); err != nil {
+		t.Fatal("failed to delete:", err)
+	}
+
+	values := []interface{}{
+		// Special cases.
+		new(string),
+		new([]byte),
+		// Non-special cases.
+		new(int),
+	}
+
+	for _, value := range values {
+		// Check the special-case path.
+		if err := s.db.Get([]byte("delete_testkey"), value); !errors.Is(err, kvpack.ErrNotFound) {
+			t.Fatal("unexpected error getting deleted key:", err)
+		}
+
+		if elem := reflect.ValueOf(value).Elem(); !elem.IsZero() {
+			t.Fatalf("unexpected value after deletion: %#v", elem.Interface())
+		}
+	}
+
+	// Check the non-special-case path.
 }
 
 // makeKey makes a full key from the given two parts.

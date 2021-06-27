@@ -319,25 +319,26 @@ func IsZero(ptr unsafe.Pointer, size uintptr) bool {
 	return IsZeroBytes(unsafe.Slice((*byte)(ptr), size))
 }
 
-// IsZeroBytes is the bytes equvalent of the IsZero function.
+// IsZeroBytes is the bytes equivalent of the IsZero function.
 func IsZeroBytes(bytes []byte) bool {
 	// Check with the whole zeroes array for as long as bytes is longer than
 	// that zero buffer.
 	for len(bytes) > zeroesLen {
-		if string(zeroes[:]) != string(bytes) {
+		// Bail if this section of bytes is not equal to 0.
+		if string(zeroes[:]) != string(bytes[:zeroesLen]) {
 			return false
 		}
 		bytes = bytes[zeroesLen:]
 	}
 
-	// Compare the rest.
+	// Return true if the rest of the bytes are equal to 0.
 	return string(zeroes[:len(bytes)]) == string(bytes)
 }
 
 var (
 	structFlight singleflight.Group
 	structMutex  sync.RWMutex
-	structCache  = map[unsafe.Pointer]*StructInfo{} // unsafe.Pointer -> *structInfo
+	structCache  = map[unsafe.Pointer]*StructInfo{}
 )
 
 type StructInfo struct {
@@ -454,6 +455,9 @@ type _iface struct {
 // InterfacePtr returns the pointer to the internal value of the given
 // interface.
 func InterfacePtr(v interface{}) unsafe.Pointer {
+	if v == nil {
+		return nil
+	}
 	return (*_iface)(unsafe.Pointer(&v)).p
 }
 

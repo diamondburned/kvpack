@@ -3,9 +3,11 @@ package defract
 import (
 	"bytes"
 	"math"
+	"math/rand"
 	"os/exec"
 	"reflect"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -50,6 +52,16 @@ func TestUnderlyingPtr(t *testing.T) {
 		}
 	})
 
+	t.Run("nested-nil", func(t *testing.T) {
+		typ, got := UnderlyingPtr((**string)(nil))
+		if got != nil {
+			t.Fatal("unexpected non-nil ptr returned from nil")
+		}
+		if typ != nil {
+			t.Fatal("unexpected type non-nil")
+		}
+	})
+
 	check := func(t *testing.T, v, expectTyp interface{}) {
 		typ, got := UnderlyingPtr(v)
 		eqType(t, typ, reflect.TypeOf(expectTyp))
@@ -85,8 +97,28 @@ func TestUnderlyingPtr(t *testing.T) {
 	})
 }
 
+func TestAllocIndirect(t *testing.T) {
+	// skip alloc test, since that's tested in driver/tests/.
+
+	t.Run("noalloc", func(t *testing.T) {
+		str := "hello, world"
+		ptr1 := &str
+		ptr2 := &ptr1
+
+		typ, ptr := AllocIndirect(reflect.TypeOf(ptr2), unsafe.Pointer(&ptr2))
+		if typ != reflect.TypeOf("") {
+			t.Fatalf("unexpected (not string) type: %v", typ)
+		}
+		if ptr != unsafe.Pointer(&str) {
+			t.Fatalf("unexpected ptr returned: expected %p got %p", unsafe.Pointer(&str), ptr)
+		}
+	})
+}
+
 func TestIsZero(t *testing.T) {
 	testWithSize := func(t *testing.T, size, offset int) {
+		t.Helper()
+
 		value := make([]byte, size)
 		if !IsZero(unsafe.Pointer(&value[0]), uintptr(len(value))) {
 			t.Error("value is not eq when it should be")
@@ -98,10 +130,47 @@ func TestIsZero(t *testing.T) {
 		}
 	}
 
-	t.Run("1024", func(t *testing.T) { testWithSize(t, 1024, 1) })
-	t.Run("4096", func(t *testing.T) { testWithSize(t, 4096, 1) })
+	t.Run("1024_end", func(t *testing.T) { testWithSize(t, 1024, 1) })
+	t.Run("1024_start", func(t *testing.T) { testWithSize(t, 1024, 1024/4) })
+	t.Run("4096_end", func(t *testing.T) { testWithSize(t, 4096, 1) })
+	t.Run("4096_start", func(t *testing.T) { testWithSize(t, 4096, 4096/4) })
 	t.Run("1024000_end", func(t *testing.T) { testWithSize(t, 1024000, 1) })
 	t.Run("1024000_start", func(t *testing.T) { testWithSize(t, 1024000, 1024000/4) })
+	t.Run("zlen_end", func(t *testing.T) { testWithSize(t, zeroesLen, 1) })
+	t.Run("zlen_start", func(t *testing.T) { testWithSize(t, zeroesLen, zeroesLen/4) })
+	t.Run("4096000_end", func(t *testing.T) { testWithSize(t, 4096000, 1) })
+	t.Run("4096000_start", func(t *testing.T) { testWithSize(t, 4096000, 4096000/4) })
+}
+
+func TestZeroOut(t *testing.T) {
+	rander := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	testWithSize := func(t *testing.T, size int) {
+		value := make([]byte, size)
+
+		// Read until the values are not completely zero. We can use IsZeroBytes
+		// because we've already tested it above.
+		for IsZeroBytes(value) {
+			_, err := rander.Read(value)
+			if err != nil {
+				t.Error("failed to math.rand Read:", err)
+				return
+			}
+		}
+
+		ZeroOutBytes(value)
+
+		if !IsZeroBytes(value) {
+			t.Log("ZeroOutBytes fail, last 0 at", bytes.LastIndexByte(value, '0'))
+			t.Error("ZeroOutBytes did not zero out completely")
+		}
+	}
+
+	t.Run("1024", func(t *testing.T) { testWithSize(t, 1024) })
+	t.Run("4096", func(t *testing.T) { testWithSize(t, 4096) })
+	t.Run("1024000", func(t *testing.T) { testWithSize(t, 1024000) })
+	t.Run("zeroesLen", func(t *testing.T) { testWithSize(t, zeroesLen) })
+	t.Run("4096000", func(t *testing.T) { testWithSize(t, 4096000) })
 }
 
 func TestIsLittleEndian(t *testing.T) {

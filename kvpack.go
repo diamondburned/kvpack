@@ -78,7 +78,8 @@ func (tx *Transaction) Delete(k []byte) error {
 		return ErrReadOnly
 	}
 
-	return tx.Put(k, nil)
+	key := tx.kb.Append(tx.namespace(), k)
+	return tx.Tx.DeletePrefix(key)
 }
 
 // namespace returns the namespace from the shared buffer.
@@ -194,6 +195,25 @@ func (db *Database) Put(k []byte, v interface{}) error {
 	defer tx.Rollback()
 
 	if err := tx.Put(k, v); err != nil {
+		return errors.Wrap(err, "failed to put")
+	}
+
+	if err := tx.Commit(); err != nil {
+		return errors.Wrap(err, "failed to commit")
+	}
+
+	return nil
+}
+
+// Delete deletes the given prefix from the database in a single transaction.
+func (db *Database) Delete(prefix []byte) error {
+	tx, err := db.Begin(false)
+	if err != nil {
+		return errors.Wrap(err, "failed to start transaction")
+	}
+	defer tx.Rollback()
+
+	if err := tx.Delete(prefix); err != nil {
 		return errors.Wrap(err, "failed to put")
 	}
 

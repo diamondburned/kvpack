@@ -12,6 +12,10 @@ import (
 	"github.com/pkg/errors"
 )
 
+// ErrNotFound is returned if the given key is not found. If the key is found,
+// but a child key is not found, then this error is not returned.
+var ErrNotFound = errors.New("key not found")
+
 func (tx *Transaction) Get(k []byte, v interface{}) error {
 	return tx.get(tx.kb.Append(tx.namespace(), k), v)
 }
@@ -37,7 +41,9 @@ func (tx *Transaction) Access(fields string, v interface{}) error {
 func (tx *Transaction) get(k []byte, v interface{}) error {
 	switch v := v.(type) {
 	case *[]byte:
-		return tx.Tx.Get(k, func(theirs []byte) error {
+		var found bool
+		err := tx.Tx.Get(k, func(theirs []byte) error {
+			found = true
 			dst := *v
 
 			if cap(dst) >= len(theirs) {
@@ -50,11 +56,26 @@ func (tx *Transaction) get(k []byte, v interface{}) error {
 			*v = dst
 			return nil
 		})
+		if !found && err == nil {
+			err = ErrNotFound
+		}
+		return err
+
 	case *string:
-		return tx.Tx.Get(k, func(theirs []byte) error {
+		var found bool
+		err := tx.Tx.Get(k, func(theirs []byte) error {
+			found = true
 			*v = string(theirs)
 			return nil
 		})
+		if !found && err == nil {
+			err = ErrNotFound
+		}
+		return err
+	}
+
+	if reflect.TypeOf(v).Kind() != reflect.Ptr {
+		return errors.New("given interface out value is not a pointer")
 	}
 
 	typ, ptr := defract.UnderlyingPtr(v)
@@ -70,9 +91,19 @@ func (tx *Transaction) getValue(
 		return ErrTooRecursed
 	}
 
-	return tx.Tx.Get(k, func(b []byte) error {
+	var found bool
+	if err := tx.Tx.Get(k, func(b []byte) error {
+		found = true
 		return tx.getValueBytes(k, b, typ, kind, ptr, rec)
-	})
+	}); err != nil {
+		return err
+	}
+
+	if rec == 0 && !found {
+		return ErrNotFound
+	}
+
+	return nil
 }
 
 func (tx *Transaction) getValueBytes(
@@ -150,11 +181,8 @@ func (tx *Transaction) getSlice(
 	if !ok {
 		return io.ErrUnexpectedEOF
 	}
-	if length64 < 0 {
-		return fmt.Errorf("length %d (%q) is negative", length64, lenBytes)
-	}
-	if length64 == 0 {
-		return nil
+	if length64 <= 0 {
+		return fmt.Errorf("length %d (%q) is invalid", length64, lenBytes)
 	}
 
 	underlying := typ.Elem()
@@ -304,7 +332,7 @@ func (tx *Transaction) getMap(
 		*mapPtr = unsafe.Pointer(mapValue.Pointer())
 	} else {
 		// Else, reuse the existing map.
-		mapValue = reflect.NewAt(typ, *mapPtr).Elem()
+		mapValue = reflect.NewAt(typ, ptr).Elem()
 	}
 
 	dbPrefix := tx.kb.Append(k, nil)
