@@ -23,11 +23,22 @@ func DoTests(t *testing.T, db *kvpack.Database) {
 		db: db,
 	}
 
+	// Be sure to restore the endianness once we're done.
+	wasLittleEndian := defract.IsLittleEndian
+	t.Cleanup(func() { defract.IsLittleEndian = wasLittleEndian })
+
+runTest:
 	t.Run("Put", func(t *testing.T) {
 		t.Run("ptr", s.testPutPtr)
 		t.Run("value", s.testPutValue)
 	})
 	t.Run("Get", s.testGet)
+
+	// Run the test twice if we're on a Little-Endian machine.
+	if defract.IsLittleEndian {
+		defract.IsLittleEndian = false
+		goto runTest
+	}
 }
 
 type extinct struct {

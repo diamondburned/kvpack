@@ -2,6 +2,7 @@ package defract
 
 import (
 	"bytes"
+	"math"
 	"os/exec"
 	"reflect"
 	"testing"
@@ -117,7 +118,7 @@ func TestIsLittleEndian(t *testing.T) {
 		}
 
 		words := bytes.Fields(line)
-		lastTwo := bytes.Join(words[:len(words)-2], []byte(" "))
+		lastTwo := bytes.Join(words[len(words)-2:], []byte(" "))
 
 		switch string(lastTwo) {
 		case "Little Endian":
@@ -131,7 +132,7 @@ func TestIsLittleEndian(t *testing.T) {
 			}
 			return
 		default:
-			t.Skip("unknown Byte Order value", string(lastTwo))
+			t.Skipf("unknown Byte Order value %q", words)
 		}
 	}
 
@@ -148,5 +149,69 @@ func TestWithinSlice(t *testing.T) {
 
 	if WithinBytes(outer, make([]byte, 0, 10)) {
 		t.Fatal("new slice is incorrectly within outer")
+	}
+}
+
+func TestNumberLE(t *testing.T) {
+	if !IsLittleEndian {
+		t.Skip("skipping NumberLE test, since not LE machine")
+	}
+
+	// Restore LE after done.
+	t.Cleanup(func() { IsLittleEndian = true })
+
+	var tests = []interface{}{
+		uint8('c'),
+		uint16(math.MaxUint16),
+		uint32(math.MaxUint32),
+		uint64(math.MaxUint64),
+		int8('c'),
+		int16(math.MaxInt16),
+		int32(math.MaxInt32),
+		int64(math.MaxInt64),
+		float32(math.Inf(-1)),
+		float32(math.Inf(+1)),
+		float64(math.Inf(-1)),
+		float64(math.Inf(+1)),
+		complex64(5 + 10i),
+		complex128(5 + 10i),
+	}
+
+	for _, test := range tests {
+		typ, ptr := UnderlyingPtr(test)
+
+		IsLittleEndian = true
+		le := NumberLE(typ.Kind(), ptr)
+
+		IsLittleEndian = false
+		be := NumberLE(typ.Kind(), ptr)
+
+		if !bytes.Equal(le, be) {
+			t.Fatalf("big endian != little endian output\nLE: %v\nBE: %v", le, be)
+		}
+
+		for name, input := range map[string][]byte{"LE": le, "BE": be} {
+			valLE := reflect.New(typ)
+
+			IsLittleEndian = true
+			if !ReadNumberLE(input, typ.Kind(), unsafe.Pointer(valLE.Pointer())) {
+				t.Fatalf("ReadNumberLE fail on Little Endian with %s input", name)
+			}
+
+			if v := valLE.Elem().Interface(); v != test {
+				t.Fatalf("ReadNumberLE Little Endian output differs: %v != %v", v, test)
+			}
+
+			valBE := reflect.New(typ)
+
+			IsLittleEndian = false
+			if !ReadNumberLE(input, typ.Kind(), unsafe.Pointer(valBE.Pointer())) {
+				t.Fatalf("ReadNumberLE fail on Big Endian with %s input", name)
+			}
+
+			if v := valBE.Elem().Interface(); v != test {
+				t.Fatalf("ReadNumberLE Big Endian output differs: %v != %v", v, test)
+			}
+		}
 	}
 }

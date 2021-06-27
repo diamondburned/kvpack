@@ -4,6 +4,7 @@ package defract
 
 import (
 	"encoding/binary"
+	"math"
 	"reflect"
 	"sync"
 	"unsafe"
@@ -58,13 +59,7 @@ var ByteSlice = reflect.TypeOf([]byte(nil))
 // ideally without copying on a 64-bit little-endian machine. The bytes are
 // always in little-endian.
 func IntLE(i *int) []byte {
-	if unsafe.Sizeof(i) == 8 && IsLittleEndian {
-		return (*[8]byte)(unsafe.Pointer(i))[:]
-	}
-
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], uint64(*i))
-	return b[:]
+	return UintLE((*uint)(unsafe.Pointer(i)))
 }
 
 // UintLE is a helper function that converts the given uint64 value into bytes,
@@ -107,10 +102,6 @@ func ReadInt64LE(dst []byte) (int64, bool) {
 // ReadNumberLE reads the little-endian number of the given byte slice into the
 // pointer. If bound checking fails, false is returned.
 func ReadNumberLE(b []byte, kind reflect.Kind, ptr unsafe.Pointer) bool {
-	if !IsLittleEndian {
-		panic("TODO ReadNumberLE Big Endian")
-	}
-
 	switch kind {
 	case reflect.Int:
 		// This is optimized away, since Sizeof is a constant.
@@ -131,6 +122,10 @@ func ReadNumberLE(b []byte, kind reflect.Kind, ptr unsafe.Pointer) bool {
 		default:
 			panic("unknown architecture, weird uint size")
 		}
+	}
+
+	if !IsLittleEndian {
+		return readNumberAsLE(b, kind, ptr)
 	}
 
 	switch kind {
@@ -168,8 +163,12 @@ func ReadNumberLE(b []byte, kind reflect.Kind, ptr unsafe.Pointer) bool {
 		return true
 
 	case reflect.Complex128:
-		// Copy returns min(b_len, value_len), so we can do this shorthand.
-		return copy(unsafe.Slice((*byte)(ptr), 16), b) == 16
+		if len(b) < 16 {
+			return false
+		}
+
+		*(*complex128)(ptr) = *(*complex128)(unsafe.Pointer(&b[0]))
+		return true
 
 	default:
 		panic("NumberLE got unsupported kind " + kind.String())
@@ -214,7 +213,15 @@ func readNumberAsLE(b []byte, kind reflect.Kind, ptr unsafe.Pointer) bool {
 		return true
 
 	case reflect.Complex128:
-		panic("Complex128 unsupported on Big Endian (TODO)")
+		if len(b) < 16 {
+			return false
+		}
+
+		r := math.Float64frombits(binary.LittleEndian.Uint64(b[0:]))
+		i := math.Float64frombits(binary.LittleEndian.Uint64(b[8:]))
+		*(*complex128)(ptr) = complex(r, i)
+		return true
+
 	default:
 		panic("numberAsLE got unsupported kind " + kind.String())
 	}
@@ -267,38 +274,33 @@ func numberAsLE(kind reflect.Kind, ptr unsafe.Pointer) []byte {
 		return b[:4]
 	case reflect.Uint64, reflect.Int64, reflect.Float64, reflect.Complex64:
 		binary.LittleEndian.PutUint64(b[:8], *(*uint64)(ptr))
-		return b[:8]
+		return b[:]
 	case reflect.Complex128:
-		panic("Complex128 unsupported on Big Endian (TODO)")
+		// It's rare to have to put a cmplx128, so it's likely more beneficial
+		// to reallocate 16B here than doing so when it's not needed most of the
+		// time.
+		var b [16]byte
+		cmplx := (*complex128)(ptr)
+		binary.LittleEndian.PutUint64(b[0:], math.Float64bits(real(*cmplx)))
+		binary.LittleEndian.PutUint64(b[8:], math.Float64bits(imag(*cmplx)))
+		return b[:]
 	default:
 		panic("numberAsLE got unsupported kind " + kind.String())
 	}
 }
 
-const zeroesLen = 102400 // 10KB
+// zeroesLen is set to 2MB. The runtime seems to indicate that there's a path
+// for anything larger than 1MB, so we pick 2MB just in case.
+const zeroesLen = 2 * 1024 * 1024
 
 // zeroes might just be one of my worst hacks to date.
 var zeroes [zeroesLen]byte
 
 // ZeroOutBytes fills the given bytes slice with zeroes.
 func ZeroOutBytes(bytes []byte) {
-	if copy(bytes, zeroes[:]) <= zeroesLen {
-		return
-	}
-
-	// Fill out the rest if copy returns exactly the length of zeroes. We can do
-	// this 8 bytes at a time by using uint64.
-	vec8End := len(bytes) - (len(bytes) % 8)
-	current := zeroesLen
-
-	for current < vec8End {
-		*(*uint64)(unsafe.Pointer(&bytes[current])) = 0
-		current += 8
-	}
-
-	for current < len(bytes) {
-		bytes[current] = 0
-		current++
+	// copy() utilizes AVX instructions when possible.
+	for copy(bytes, zeroes[:]) == zeroesLen {
+		bytes = bytes[zeroesLen:]
 	}
 }
 
@@ -314,44 +316,22 @@ func ZeroOut(ptr unsafe.Pointer, size uintptr) {
 // IsZero returns true if the data at the given pointer is all zero. The
 // function scans the data up to the given length.
 func IsZero(ptr unsafe.Pointer, size uintptr) bool {
-	rawValue := unsafe.Slice((*byte)(ptr), size)
-
-	if size < zeroesLen {
-		// Fast path that utilizes Go's intrinsics for comparison.
-		return string(zeroes[:size]) == string(rawValue)
-	}
-
-	// Compare using the fast path the first zeroesLen bytes anyway.
-	if string(zeroes[:]) != string(rawValue[:zeroesLen]) {
-		return false
-	}
-
-	return isZeroAny(rawValue[zeroesLen:])
+	return IsZeroBytes(unsafe.Slice((*byte)(ptr), size))
 }
 
-func isZeroAny(bytes []byte) bool {
-	// vec8End defines the boundary in which the increment-by-8 loop cannot go
-	// further.
-	vec8End := len(bytes) - (len(bytes) % 8)
-	current := 0
-
-	// Compare (hopefully) most of the buffer 8 bytes at a time.
-	for current < vec8End {
-		if *(*uint64)(unsafe.Pointer(&bytes[current])) != 0 {
+// IsZeroBytes is the bytes equvalent of the IsZero function.
+func IsZeroBytes(bytes []byte) bool {
+	// Check with the whole zeroes array for as long as bytes is longer than
+	// that zero buffer.
+	for len(bytes) > zeroesLen {
+		if string(zeroes[:]) != string(bytes) {
 			return false
 		}
-		current += 8
+		bytes = bytes[zeroesLen:]
 	}
 
-	// Compare the rest using a regular loop.
-	for current < len(bytes) {
-		if bytes[current] != 0 {
-			return false
-		}
-		current++
-	}
-
-	return true
+	// Compare the rest.
+	return string(zeroes[:len(bytes)]) == string(bytes)
 }
 
 var (
