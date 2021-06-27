@@ -1,5 +1,8 @@
 # kvpack
 
+[![pipeline status](https://gitlab.com/diamondburned/kvpack/badges/unsafe-footgun/pipeline.svg)](https://gitlab.com/diamondburned/kvpack/-/commits/unsafe-footgun)
+[![coverage report](https://gitlab.com/diamondburned/kvpack/badges/unsafe-footgun/coverage.svg)](https://gitlab.com/diamondburned/kvpack/-/commits/unsafe-footgun)
+
 Performant marshaler and unmarshaler library for transactional key-value
 databases.
 

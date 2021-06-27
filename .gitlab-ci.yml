@@ -1,0 +1,37 @@
+{
+  "image": "golang:rc-alpine",
+  "variables": {
+    "GO111MODULE": "on",
+    "CGO_ENABLED": "1", # for the race detector
+    "COV": "/tmp/cov_results",
+  },
+  "before_script": [
+    "apk add git build-base"
+  ],
+  "stages": [
+    "test",
+    "benchmark"
+  ],
+  "unit_test": {
+    "stage": "test",
+    "timeout": "5m",
+    "script": [
+      "go test -race -gcflags=all=-d=checkptr ./..."
+    ]
+  },
+  "coverage": {
+    "stage": "test",
+    "timeout": "5m",
+    "script": [
+      "go test -coverprofile=$COV -coverpkg=. -bench=. -benchtime=25ms ./...",
+      "go tool cover -func $COV"
+    ]
+  },
+  "benchmark": {
+    "stage": "benchmark",
+    "timeout": "5m",
+    "script": [
+      "go test ./... -bench=."
+    ]
+  }
+}
