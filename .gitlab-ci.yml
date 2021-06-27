@@ -1,5 +1,5 @@
 {
-  "image": "golang:alpine",
+  "image": "golang:rc-alpine",
   "variables": {
     "GO111MODULE": "on",
     "CGO_ENABLED": "1", # for the race detector
