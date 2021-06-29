@@ -29,7 +29,13 @@ type Transaction interface {
 	// DeletePrefix wipes a key with the given prefix.
 	DeletePrefix(prefix []byte) error
 	// Iterate iterates over all keys with the given prefix in undefined order.
-	// It is used for iterating over arrays.
+	// It is used for iterating over arrays. The prefix will always contain a
+	// trailing delimiter.
+	//
+	// If possible, the implementation should always skip ahead keys that are
+	// children of the current-level key. For example, if the current key is
+	// "hello<sep>", then "hello<sep>world" is valid, but
+	// "hello<sep>world<sep>child" should be skipped.
 	Iterate(prefix []byte, fn func(k, v []byte) error) error
 }
 

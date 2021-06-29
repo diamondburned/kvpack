@@ -113,12 +113,16 @@ func (kb *Arena) AppendExtra(head, tail []byte, extra int) (newBuf, extraBuf []b
 		end += copy(new[end:], tail)
 
 		// The new slice has the exact length needed minus the extra.
-		newBuf = new[:end]
+		newBuf = new[:end:end]
 
 		// Kill the GC. Create a new keyBuffer entry with the "previous" field
 		// pointing to the current one, then set the current one to the new one.
 		old := kb.keyBuffer
 		kb.keyBuffer = &keyBuffer{Buffer: new, prev: old}
+
+		if extra > 0 {
+			extraBuf = new[end : end+extra]
+		}
 
 	} else {
 		// Set newBuf to the tail of the backing array.
@@ -130,22 +134,22 @@ func (kb *Arena) AppendExtra(head, tail []byte, extra int) (newBuf, extraBuf []b
 
 		// Slice the original slice to include the new section without the extra
 		// part.
-		newBuf = kb.Buffer[start:]
+		newBuf = kb.Buffer[start:len(kb.Buffer):len(kb.Buffer)]
 
 		if extra > 0 {
+			extraEnd := len(kb.Buffer) + extra
+			extraBuf = kb.Buffer[len(kb.Buffer):extraEnd:extraEnd]
+
 			// Include the extra allocated parts into the main buffer so the
 			// next call doesn't override it.
-			kb.Buffer = kb.Buffer[:len(kb.Buffer)+extra]
+			kb.Buffer = kb.Buffer[:extraEnd]
 		}
 	}
 
-	if extra == 0 {
-		return newBuf, nil
+	if extraBuf != nil {
+		// Ensure the extra buffer is always zeroed out.
+		defract.ZeroOutBytes(extraBuf)
 	}
 
-	extraBuf = newBuf[len(newBuf) : len(newBuf)+extra]
-	// Ensure the extra buffer is always zeroed out.
-	defract.ZeroOutBytes(extraBuf)
-
-	return newBuf, extraBuf
+	return
 }

@@ -5,21 +5,26 @@ import (
 	"testing"
 
 	"github.com/diamondburned/kvpack"
+	"github.com/pkg/errors"
 )
 
-type benchmarkStruct struct {
+// CharacterData is a struct used for benchmarking.
+type CharacterData struct {
 	BestCharacter   string
 	CharacterScore  int32
-	OtherCharacters []benchmarkStruct
+	OtherCharacters []CharacterData
 }
 
-var benchmarkValue = benchmarkStruct{
-	BestCharacter:  "Astolfo",
-	CharacterScore: 100,
-	OtherCharacters: []benchmarkStruct{
-		{"Felix Argyle", 100, nil},
-		{"Hime Arikawa", 100, nil},
-	},
+// NewCharacterData creates a character data value with dummy values.
+func NewCharacterData() CharacterData {
+	return CharacterData{
+		BestCharacter:  "Astolfo",
+		CharacterScore: 100,
+		OtherCharacters: []CharacterData{
+			{"Felix Argyle", 100, nil},
+			{"Hime Arikawa", 100, nil},
+		},
+	}
 }
 
 type Benchmarker struct {
@@ -42,63 +47,84 @@ func DoBenchmark(b *testing.B, db *kvpack.Database) {
 	b.Run("GetJSON", ber.BenchmarkGetJSON)
 }
 
+func (ber Benchmarker) mustTx(b *testing.B, ro bool, f func(tx *kvpack.Transaction) error) {
+	var err error
+	if ro {
+		err = ber.db.View(f)
+	} else {
+		err = ber.db.Update(f)
+	}
+	if err != nil {
+		b.Fatal("tx fail:", err)
+	}
+}
+
 func (ber Benchmarker) BenchmarkPutKVPack(b *testing.B) {
 	k := []byte("benchmark_put_kvpack")
-	v := benchmarkValue
+	v := NewCharacterData()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		if err := ber.db.Put(k, &v); err != nil {
-			b.Fatal("failed to put:", err)
+	ber.mustTx(b, false, func(tx *kvpack.Transaction) error {
+		for i := 0; i < b.N; i++ {
+			if err := tx.Put(k, &v); err != nil {
+				return errors.Wrap(err, "failed to put")
+			}
 		}
-	}
+		return nil
+	})
 }
 
 func (ber Benchmarker) BenchmarkPutJSON(b *testing.B) {
 	k := []byte("benchmark_put_json")
-	v := benchmarkValue
+	v := NewCharacterData()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		j, err := json.Marshal(v)
-		if err != nil {
-			b.Fatal("failed to encode:", err)
+	ber.mustTx(b, false, func(tx *kvpack.Transaction) error {
+		for i := 0; i < b.N; i++ {
+			j, err := json.Marshal(v)
+			if err != nil {
+				return errors.Wrap(err, "failed to encode")
+			}
+			if err := tx.Put(k, &j); err != nil {
+				return errors.Wrap(err, "failed to put")
+			}
 		}
-
-		if err := ber.db.Put(k, &j); err != nil {
-			b.Fatal("failed to put:", err)
-		}
-	}
+		return nil
+	})
 }
 
 func (ber Benchmarker) BenchmarkGetKVPack(b *testing.B) {
 	k := []byte("benchmark_get_kvpack")
+	v := NewCharacterData()
 
-	if err := ber.db.Put(k, &benchmarkValue); err != nil {
+	if err := ber.db.Put(k, &v); err != nil {
 		b.Fatal("failed to put:", err)
 	}
 
-	v := benchmarkStruct{}
+	into := CharacterData{}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		if err := ber.db.Get(k, &v); err != nil {
-			b.Fatal("failed to get:", err)
+	ber.mustTx(b, true, func(tx *kvpack.Transaction) error {
+		for i := 0; i < b.N; i++ {
+			if err := tx.Get(k, &into); err != nil {
+				return errors.Wrap(err, "failed to get")
+			}
 		}
-	}
+		return nil
+	})
 }
 
 func (ber Benchmarker) BenchmarkGetJSON(b *testing.B) {
 	k := []byte("benchmark_get_json")
-	v := benchmarkStruct{}
+	v := NewCharacterData()
 
-	jsonData, err := json.Marshal(&benchmarkValue)
+	jsonData, err := json.Marshal(&v)
 	if err != nil {
 		b.Fatal("failed to encode:", err)
 	}
@@ -112,13 +138,15 @@ func (ber Benchmarker) BenchmarkGetJSON(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		if err := ber.db.Get(k, &output); err != nil {
-			b.Fatal("failed to get:", err)
+	ber.mustTx(b, true, func(tx *kvpack.Transaction) error {
+		for i := 0; i < b.N; i++ {
+			if err := tx.Get(k, &output); err != nil {
+				return errors.Wrap(err, "failed to get")
+			}
+			if err := json.Unmarshal(output, &v); err != nil {
+				return errors.Wrap(err, "failed to decode")
+			}
 		}
-
-		if err := json.Unmarshal(output, &v); err != nil {
-			b.Fatal("failed to decode:", err)
-		}
-	}
+		return nil
+	})
 }

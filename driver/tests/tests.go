@@ -10,6 +10,7 @@ import (
 
 	"github.com/diamondburned/kvpack"
 	"github.com/diamondburned/kvpack/defract"
+	"github.com/diamondburned/kvpack/driver"
 	"github.com/go-test/deep"
 )
 
@@ -365,6 +366,13 @@ func (s suite) makeKey(midKey, tailKey string) string {
 	return strings.Join(parts, kvpack.Separator)
 }
 
+// TODO Dumper interface
+
+// // Dumper is an interface that databases can satisfy to dump the database.
+// type Dumper interface {
+// 	Dump(prefix []byte, v map[string]string) error
+// }
+
 // Expect verifies that the test suite's database contains the given data in the
 // o map of the key.
 func (s suite) Expect(t *testing.T, key string, o map[string]string) {
@@ -373,46 +381,42 @@ func (s suite) Expect(t *testing.T, key string, o map[string]string) {
 	key = strings.ReplaceAll(key, ".", kvpack.Separator)
 
 	rootKey := s.db.Namespace() + kvpack.Separator + key
-	dump := make(map[string]string)
 
-	// Dump the whole database out.
-	if err := s.db.View(func(tx *kvpack.Transaction) error {
-		return tx.Tx.Iterate([]byte(rootKey), func(k, v []byte) error {
-			dump[string(k)] = string(v)
-			return nil
-		})
-	}); err != nil {
-		t.Error("failed to dump db:", err)
-		return
+	tx, err := s.db.Begin(true)
+	if err != nil {
+		t.Error("failed to begin RO tx in Expect:", err)
 	}
+	defer tx.Rollback()
 
 	// Expect the root key.
-	if _, ok := dump[rootKey]; !ok {
-		t.Errorf("missing root key %q", rootKey)
-		return
+	if _, err := tx.Tx.Get([]byte(rootKey)); err != nil {
+		if errors.Is(err, driver.ErrKeyNotFound) {
+			t.Errorf("missing root key %q", rootKey)
+			return
+		}
+
+		t.Fatal("unexpected error getting root key:", err)
 	}
-	delete(dump, rootKey)
 
 	for k, v := range o {
 		fullKey := s.makeKey(key, k)
 
-		got, ok := dump[fullKey]
-		if !ok {
-			t.Errorf("missing key %q value %q", fullKey, v)
+		b, err := tx.Tx.Get([]byte(fullKey))
+		if err != nil {
+			if errors.Is(err, driver.ErrKeyNotFound) {
+				t.Errorf("missing key %q", fullKey)
+				continue
+			}
+
+			t.Fatalf("unexpected error getting key %q: %v", b, err)
+		}
+
+		if v != string(b) {
+			t.Errorf("key %q value expected %q, got %q", fullKey, v, b)
 			continue
 		}
 
-		if v != got {
-			t.Errorf("key %q value expected %q, got %q", fullKey, v, got)
-			continue
-		}
-
-		delete(dump, fullKey)
-		delete(o, k)
-	}
-
-	for k, v := range dump {
-		t.Errorf("excess key %q value %q", k, v)
+		// delete(o, k)
 	}
 }
 

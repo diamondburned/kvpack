@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log"
 	"reflect"
 	"strconv"
 	"unsafe"
@@ -132,7 +131,6 @@ func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) 
 
 	onEach := func(k []byte) error {
 		fieldKey := bytes.TrimPrefix(k, key)
-
 		// Ensure that this is the key we expect by verifying that it only has
 		// one part.
 		if bytes.Contains(fieldKey, []byte(Separator)) {
@@ -288,8 +286,13 @@ func (tx *Transaction) getSlice(
 
 	return tx.Tx.Iterate(prefix, func(k, v []byte) error {
 		// Trim the key, split the delimiters and parse the index.
-		keyTail := bytes.TrimPrefix(k, prefix)
-		ixBytes := bytes.SplitN(keyTail, []byte(Separator), 2)[0]
+		ixBytes := bytes.TrimPrefix(k, prefix)
+		// Confirm that the key only contains the needed tail. If it's any of
+		// the children keys, then we skip it, because we're doing more work
+		// than needed.
+		if bytes.Contains(ixBytes, []byte(Separator)) {
+			return nil
+		}
 
 		i, err := strconv.ParseInt(defract.BytesToStr(ixBytes), 10, 64)
 		if err != nil {
@@ -311,19 +314,9 @@ func (tx *Transaction) getStruct(
 		return ErrTooRecursed
 	}
 
-	var currentKey []byte
-
-	defer func() {
-		if v := recover(); v != nil {
-			log.Printf("panicking at key %q", currentKey)
-			panic(v)
-		}
-	}()
-
 	for _, field := range info.Fields {
 		ptr := unsafe.Add(ptr, field.Offset)
 		key := tx.kb.Append(k, field.Name)
-		currentKey = key
 
 		b, err := tx.Tx.Get(key)
 		if err != nil {
