@@ -3,6 +3,7 @@ package bboltpack
 
 import (
 	"bytes"
+	"log"
 	"os"
 
 	"github.com/diamondburned/kvpack"
@@ -101,6 +102,12 @@ func (tx *Tx) Rollback() error {
 
 // Get gets the value with the given key.
 func (tx *Tx) Get(k []byte) ([]byte, error) {
+	defer func() {
+		if v := recover(); v != nil {
+			log.Printf("repanicking... root %v, tx id %v", tx.Bucket.Root(), tx.Bucket.Tx().ID())
+			panic(v)
+		}
+	}()
 	v := tx.Bucket.Get(k)
 	if v != nil {
 		return v, nil

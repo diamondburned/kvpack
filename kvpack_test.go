@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/diamondburned/kvpack/driver"
 )
 
 type miniTx struct {
@@ -18,12 +20,12 @@ func (tx miniTx) Put(k, v []byte) error {
 	return nil
 }
 
-func (tx miniTx) Get(k []byte, fn func([]byte) error) error {
+func (tx miniTx) Get(k []byte) ([]byte, error) {
 	v, ok := tx.v[string(k)]
 	if ok {
-		return fn([]byte(v))
+		return []byte(v), nil
 	}
-	return fn(nil)
+	return nil, driver.ErrKeyNotFound
 }
 
 func (tx miniTx) Iterate(prefix []byte, fn func(k, v []byte) error) error {

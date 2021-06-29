@@ -32,6 +32,22 @@ func TestSuite(t *testing.T) {
 	tests.DoTests(t, mustOpenInMemory(t, "tests"))
 }
 
-func BenchmarkSuite(b *testing.B) {
-	tests.DoBenchmark(b, mustOpenInMemory(b, "benchmarks"))
+func BenchmarkGetKVPack(b *testing.B) {
+	db := mustOpenInMemory(b, "get_kvpack")
+	tests.NewBenchmarker(b, db).BenchmarkGetKVPack(b)
+}
+
+func BenchmarkGetJSON(b *testing.B) {
+	db := mustOpenInMemory(b, "get_json")
+	tests.NewBenchmarker(b, db).BenchmarkGetJSON(b)
+}
+
+func BenchmarkPutKVPack(b *testing.B) {
+	db := mustOpenInMemory(b, "put_kvpack")
+	tests.NewBenchmarker(b, db).BenchmarkPutKVPack(b)
+}
+
+func BenchmarkPutJSON(b *testing.B) {
+	db := mustOpenInMemory(b, "put_json")
+	tests.NewBenchmarker(b, db).BenchmarkPutJSON(b)
 }

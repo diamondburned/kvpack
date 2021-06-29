@@ -22,26 +22,27 @@ var benchmarkValue = benchmarkStruct{
 	},
 }
 
-type benchmarker struct {
-	b  *testing.B
+type Benchmarker struct {
+	tb testing.TB
 	db *kvpack.Database
+}
+
+func NewBenchmarker(tb testing.TB, db *kvpack.Database) Benchmarker {
+	return Benchmarker{tb, db}
 }
 
 // DoBenchmark runs all benchmarks in the suite.
 func DoBenchmark(b *testing.B, db *kvpack.Database) {
-	ber := benchmarker{
-		b:  b,
-		db: db,
-	}
+	ber := NewBenchmarker(b, db)
 
-	b.Run("PutKVPack", ber.benchmarkPutKVPack)
-	b.Run("PutJSON", ber.benchmarkPutJSON)
+	b.Run("PutKVPack", ber.BenchmarkPutKVPack)
+	b.Run("PutJSON", ber.BenchmarkPutJSON)
 
-	b.Run("GetKVPack", ber.benchmarkGetKVPack)
-	b.Run("GetJSON", ber.benchmarkGetJSON)
+	b.Run("GetKVPack", ber.BenchmarkGetKVPack)
+	b.Run("GetJSON", ber.BenchmarkGetJSON)
 }
 
-func (ber *benchmarker) benchmarkPutKVPack(b *testing.B) {
+func (ber Benchmarker) BenchmarkPutKVPack(b *testing.B) {
 	k := []byte("benchmark_put_kvpack")
 	v := benchmarkValue
 
@@ -55,7 +56,7 @@ func (ber *benchmarker) benchmarkPutKVPack(b *testing.B) {
 	}
 }
 
-func (ber *benchmarker) benchmarkPutJSON(b *testing.B) {
+func (ber Benchmarker) BenchmarkPutJSON(b *testing.B) {
 	k := []byte("benchmark_put_json")
 	v := benchmarkValue
 
@@ -74,13 +75,14 @@ func (ber *benchmarker) benchmarkPutJSON(b *testing.B) {
 	}
 }
 
-func (ber *benchmarker) benchmarkGetKVPack(b *testing.B) {
+func (ber Benchmarker) BenchmarkGetKVPack(b *testing.B) {
 	k := []byte("benchmark_get_kvpack")
-	v := benchmarkStruct{}
 
 	if err := ber.db.Put(k, &benchmarkValue); err != nil {
 		b.Fatal("failed to put:", err)
 	}
+
+	v := benchmarkStruct{}
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -92,7 +94,7 @@ func (ber *benchmarker) benchmarkGetKVPack(b *testing.B) {
 	}
 }
 
-func (ber *benchmarker) benchmarkGetJSON(b *testing.B) {
+func (ber Benchmarker) BenchmarkGetJSON(b *testing.B) {
 	k := []byte("benchmark_get_json")
 	v := benchmarkStruct{}
 

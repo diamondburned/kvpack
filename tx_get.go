@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"reflect"
 	"strconv"
 	"unsafe"
@@ -310,11 +311,29 @@ func (tx *Transaction) getStruct(
 		return ErrTooRecursed
 	}
 
+	var currentKey []byte
+
+	defer func() {
+		if v := recover(); v != nil {
+			log.Printf("panicking at key %q", currentKey)
+			panic(v)
+		}
+	}()
+
 	for _, field := range info.Fields {
 		ptr := unsafe.Add(ptr, field.Offset)
 		key := tx.kb.Append(k, field.Name)
+		currentKey = key
 
-		if err := tx.getValue(key, field.Type, field.Kind, ptr, rec+1); err != nil {
+		b, err := tx.Tx.Get(key)
+		if err != nil {
+			if errors.Is(err, driver.ErrKeyNotFound) {
+				continue
+			}
+			return errors.Wrapf(err, "failed to get value for struct field key %q", key)
+		}
+
+		if err := tx.getValueBytes(key, b, field.Type, field.Kind, ptr, rec+1); err != nil {
 			return errors.Wrapf(err, "struct %s field %s", info.Type, field.Name)
 		}
 	}
