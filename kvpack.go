@@ -1,6 +1,8 @@
 package kvpack
 
 import (
+	"io"
+
 	"github.com/diamondburned/kvpack/driver"
 	"github.com/diamondburned/kvpack/internal/key"
 	"github.com/pkg/errors"
@@ -143,6 +145,15 @@ func NewDatabase(db driver.Database, namespace string) *Database {
 	}
 }
 
+// Close closes the database if it implements io.Closer.
+func (db *Database) Close() error {
+	closer, ok := db.Database.(io.Closer)
+	if ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 // Namespace returns the database's namespace, which is the prefix that is
 // always prepended into keys.
 func (db *Database) Namespace() string {
@@ -224,6 +235,22 @@ func (db *Database) Get(k []byte, v interface{}) error {
 	return nil
 }
 
+// Each iterates over the dot-syntax fields key from the database in a single
+// transaction. Refer to Transaction's Each for more documentation.
+func (db *Database) Each(fields string, v interface{}, eachFn func(k []byte) (done bool)) error {
+	tx, err := db.Begin(true)
+	if err != nil {
+		return errors.Wrap(err, "failed to start transaction")
+	}
+	defer tx.Rollback()
+
+	if err := tx.Each(fields, v, eachFn); err != nil {
+		return errors.Wrap(err, "failed to get")
+	}
+
+	return nil
+}
+
 // PutFields puts the given value into the database with the given dot-syntax
 // key in a single transaction.
 func (db *Database) PutFields(fields string, v interface{}) error {
@@ -298,22 +325,6 @@ func (db *Database) DeleteFields(fields string) error {
 
 	if err := tx.Commit(); err != nil {
 		return errors.Wrap(err, "failed to commit")
-	}
-
-	return nil
-}
-
-// Each iterates over the dot-syntax fields key from the database in a single
-// transaction. Refer to Transaction's Each for more documentation.
-func (db *Database) Each(fields string, v interface{}, eachFn func(k []byte) (done bool)) error {
-	tx, err := db.Begin(true)
-	if err != nil {
-		return errors.Wrap(err, "failed to start transaction")
-	}
-	defer tx.Rollback()
-
-	if err := tx.Each(fields, v, eachFn); err != nil {
-		return errors.Wrap(err, "failed to get")
 	}
 
 	return nil

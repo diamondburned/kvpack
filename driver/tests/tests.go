@@ -148,7 +148,7 @@ func (s suite) testPutPtr(t *testing.T) {
 	if err := s.db.Update(func(tx *kvpack.Transaction) error {
 		return tx.Put([]byte("put_ptr_2"), &testValue)
 	}); err != nil {
-		t.Error("failed to put testValue using db.Update:", err)
+		t.Error("failed to put &testValue using db.Update:", err)
 	}
 	s.testExpect(t, "put_ptr_2")
 }
@@ -341,7 +341,8 @@ func (s suite) testDelete(t *testing.T) {
 
 	for _, value := range values {
 		// Check the special-case path.
-		if err := s.db.Get([]byte("delete_testkey"), value); !errors.Is(err, kvpack.ErrNotFound) {
+		err := s.db.Get([]byte("delete_testkey"), value)
+		if !errors.Is(err, kvpack.ErrKeyNotFound) {
 			t.Fatal("unexpected error getting deleted key:", err)
 		}
 

@@ -12,9 +12,7 @@ import (
 )
 
 // DB implements driver.Database.
-type DB struct {
-	badger.DB
-}
+type DB badger.DB
 
 // Open opens a new Badger database wrapped inside a driver.Database-compatible
 // implementation.
@@ -23,16 +21,21 @@ func Open(namespace string, opts badger.Options) (*kvpack.Database, error) {
 	if err != nil {
 		return nil, err
 	}
-	return kvpack.NewDatabase(&DB{*d}, namespace), nil
+	return kvpack.NewDatabase((*DB)(d), namespace), nil
 }
 
 // Begin starts a transaction.
 func (db *DB) Begin(ro bool) (driver.Transaction, error) {
-	txn := db.NewTransaction(!ro)
+	txn := (*badger.DB)(db).NewTransaction(!ro)
 	return &Txn{
 		Txn:       txn,
 		preloaded: nil,
 	}, nil
+}
+
+// Close closes the database.
+func (db *DB) Close() error {
+	return (*badger.DB)(db).Close()
 }
 
 // Txn implements driver.Transaction.
@@ -48,14 +51,19 @@ var (
 
 // Commit commits the current transaction.
 func (txn *Txn) Commit() error {
+	txn.cleanup()
 	return txn.Txn.Commit()
 }
 
 // Rollback discards the current transaction.
 func (txn *Txn) Rollback() error {
+	txn.cleanup()
 	txn.Txn.Discard()
-	txn.preloaded = nil
 	return nil
+}
+
+func (txn *Txn) cleanup() {
+	txn.preloaded = nil
 }
 
 // Preload preloads the given prefix.
@@ -91,21 +99,28 @@ func (txn *Txn) Unload(prefix []byte) {
 }
 
 // Get gets the value with the given key.
-func (txn *Txn) Get(k []byte, fn func([]byte) error) error {
+func (txn *Txn) Get(k []byte) ([]byte, error) {
 	if v, ok := txn.preloaded[defract.BytesToStr(k)]; ok {
-		return fn(v)
+		return v, nil
 	}
 
 	v, err := txn.Txn.Get(k)
 	if err != nil {
 		if errors.Is(err, badger.ErrKeyNotFound) {
-			return nil
+			return nil, driver.ErrKeyNotFound
 		}
-
-		return err
+		return nil, err
 	}
 
-	return v.Value(fn)
+	var value []byte
+	if err := v.Value(func(v []byte) error {
+		value = v
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return value, nil
 }
 
 // Put puts the given value into the given key.
@@ -121,10 +136,7 @@ func (txn *Txn) DeletePrefix(prefix []byte) error {
 		return nil
 	}
 
-	iter := txn.Txn.NewIterator(badger.IteratorOptions{
-		Prefix:         prefix,
-		PrefetchValues: false,
-	})
+	iter := txn.Txn.NewIterator(badger.IteratorOptions{})
 	defer iter.Close()
 
 	for iter.Rewind(); iter.Valid(); iter.Next() {
@@ -144,7 +156,7 @@ func (txn *Txn) DeletePrefix(prefix []byte) error {
 func (txn *Txn) Iterate(prefix []byte, fn func(k, v []byte) error) error {
 	iter := txn.Txn.NewIterator(badger.IteratorOptions{
 		Prefix:         prefix,
-		PrefetchSize:   10,
+		PrefetchSize:   1,
 		PrefetchValues: true,
 	})
 	defer iter.Close()

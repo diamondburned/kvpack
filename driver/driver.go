@@ -9,13 +9,10 @@ type Database interface {
 	Begin(readOnly bool) (Transaction, error)
 }
 
-// ErrUnsupportedIterator should be returned by transactions from Iterate if the
-// database doesn't support iterating using the Iterate API. In that case,
-// kvpack will try using the ManualIterator API instead.
-var ErrUnsupportedIterator = errors.New("unsupported iterator")
+// ErrKeyNotFound is returned if a key is not found.
+var ErrKeyNotFound = errors.New("key not found")
 
 // Transaction describes a regular transaction with a simple read and write API.
-// Transactions must implement UnorderedIterator to read maps.
 type Transaction interface {
 	Commit() error
 	Rollback() error
@@ -25,14 +22,14 @@ type Transaction interface {
 	// callback will never store the byte slice outside. The error returned from
 	// the callback should be passed through. If the key is not found, then Get
 	// should return a nil error and not call fn.
-	Get(k []byte, fn func([]byte) error) error
+	Get(k []byte) ([]byte, error)
 	// Put puts the given value into the given key. It must not keep any of the
 	// given byte slices after the call.
 	Put(k, v []byte) error
 	// DeletePrefix wipes a key with the given prefix.
 	DeletePrefix(prefix []byte) error
 	// Iterate iterates over all keys with the given prefix in undefined order.
-	// It is used for iterating over maps and optionally arrays.
+	// It is used for iterating over arrays.
 	Iterate(prefix []byte, fn func(k, v []byte) error) error
 }
 

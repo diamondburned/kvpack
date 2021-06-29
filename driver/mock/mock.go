@@ -28,6 +28,10 @@ func newDatabase() *Database {
 	}
 }
 
+var kvPairPool = sync.Pool{
+	New: func() interface{} { return make([]kvPair, 0, 256) },
+}
+
 // Begin starts a transaction.
 func (db *Database) Begin(ro bool) (driver.Transaction, error) {
 	if ro {
@@ -35,7 +39,7 @@ func (db *Database) Begin(ro bool) (driver.Transaction, error) {
 	}
 
 	return &Transaction{
-		tmp: make([]kvPair, 0, 128),
+		tmp: kvPairPool.Get().([]kvPair),
 		db:  db,
 	}, nil
 }
@@ -79,8 +83,7 @@ func (tx *Transaction) Commit() error {
 	}
 
 	// Invalidate.
-	tx.tmp = nil
-	tx.del = nil
+	tx.Rollback()
 
 	return nil
 }
@@ -88,17 +91,25 @@ func (tx *Transaction) Commit() error {
 // Rollback invalidates the transaction and does not commit data to the
 // database.
 func (tx *Transaction) Rollback() error {
-	tx.tmp = nil
-	tx.del = nil
+	if tx.tmp != nil {
+		for i := range tx.tmp {
+			tx.tmp[i] = kvPair{} // null out
+		}
+
+		kvPairPool.Put(tx.tmp[:0])
+		tx.tmp = nil
+		tx.del = nil
+	}
+
 	return nil
 }
 
 // Get checks both the changes made during the transaction and before it, and
 // calls fn() on the gotten value, if any.
-func (tx *Transaction) Get(k []byte, fn func([]byte) error) error {
+func (tx *Transaction) Get(k []byte) ([]byte, error) {
 	for _, pair := range tx.tmp {
 		if string(pair[0]) == string(k) {
-			return fn(pair[1])
+			return pair[1], nil
 		}
 	}
 
@@ -107,10 +118,10 @@ func (tx *Transaction) Get(k []byte, fn func([]byte) error) error {
 
 	s, ok := tx.db.v[string(k)]
 	if ok {
-		return fn([]byte(s))
+		return []byte(s), nil
 	}
 
-	return nil
+	return nil, driver.ErrKeyNotFound
 }
 
 // Put adds the given key and value pair into the uncommitted map.

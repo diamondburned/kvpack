@@ -13,9 +13,9 @@ import (
 	"github.com/pkg/errors"
 )
 
-// ErrNotFound is returned if the given key is not found. If the key is found,
-// but a child key is not found, then this error is not returned.
-var ErrNotFound = errors.New("key not found")
+// ErrKeyNotFound is returned if the given key is not found. If the key is
+// found, but a child key is not found, then this error is not returned.
+var ErrKeyNotFound = errors.New("key not found")
 
 func (tx *Transaction) Get(k []byte, v interface{}) error {
 	return tx.get(tx.kb.Append(tx.namespace(), k), v)
@@ -41,37 +41,34 @@ func (tx *Transaction) preloader() driver.Preloader {
 func (tx *Transaction) get(k []byte, v interface{}) error {
 	switch v := v.(type) {
 	case *[]byte:
-		var found bool
-		err := tx.Tx.Get(k, func(theirs []byte) error {
-			found = true
-			dst := *v
-
-			if cap(dst) >= len(theirs) {
-				*v = append(dst[:0], theirs...)
-				return nil
+		b, err := tx.Tx.Get(k)
+		if err != nil {
+			if errors.Is(err, driver.ErrKeyNotFound) {
+				return ErrKeyNotFound
 			}
-
-			dst = make([]byte, len(theirs))
-			copy(dst, theirs)
-			*v = dst
-			return nil
-		})
-		if !found && err == nil {
-			err = ErrNotFound
+			return err
 		}
-		return err
+
+		if cap(*v) >= len(b) {
+			*v = append((*v)[:0], b...)
+			return nil
+		}
+
+		*v = make([]byte, len(b))
+		copy(*v, b)
+		return nil
 
 	case *string:
-		var found bool
-		err := tx.Tx.Get(k, func(theirs []byte) error {
-			found = true
-			*v = string(theirs)
-			return nil
-		})
-		if !found && err == nil {
-			err = ErrNotFound
+		b, err := tx.Tx.Get(k)
+		if err != nil {
+			if errors.Is(err, driver.ErrKeyNotFound) {
+				return ErrKeyNotFound
+			}
+			return err
 		}
-		return err
+
+		*v = string(b)
+		return nil
 	}
 
 	typ, ptr := defract.UnderlyingPtr(v)
@@ -182,19 +179,15 @@ func (tx *Transaction) getValue(
 		return ErrTooRecursed
 	}
 
-	var found bool
-	if err := tx.Tx.Get(k, func(b []byte) error {
-		found = true
-		return tx.getValueBytes(k, b, typ, kind, ptr, rec)
-	}); err != nil {
+	b, err := tx.Tx.Get(k)
+	if err != nil {
+		if errors.Is(err, driver.ErrKeyNotFound) {
+			return ErrKeyNotFound
+		}
 		return err
 	}
 
-	if rec == 0 && !found {
-		return ErrNotFound
-	}
-
-	return nil
+	return tx.getValueBytes(k, b, typ, kind, ptr, rec)
 }
 
 func (tx *Transaction) getValueBytes(

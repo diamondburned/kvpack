@@ -1,21 +1,25 @@
-package badgerpack
+package bboltpack
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
-	"github.com/dgraph-io/badger/v3"
-	"github.com/dgraph-io/badger/v3/options"
 	"github.com/diamondburned/kvpack"
 	"github.com/diamondburned/kvpack/driver/tests"
+	"go.etcd.io/bbolt"
 )
 
 func mustOpenInMemory(tb testing.TB, namespace string) *kvpack.Database {
-	opts := badger.DefaultOptions("")
-	opts.Logger = nil
-	opts.InMemory = true
-	opts.Compression = options.None
+	temp := tb.TempDir()
 
-	d, err := Open(namespace, opts)
+	opts := &bbolt.Options{
+		Timeout:      0,
+		NoGrowSync:   false,
+		FreelistType: bbolt.FreelistArrayType,
+	}
+
+	d, err := Open(namespace, filepath.Join(temp, "db"), os.ModePerm, opts)
 	if err != nil {
 		tb.Fatal("failed to open in-memory badgerDB:", err)
 	}

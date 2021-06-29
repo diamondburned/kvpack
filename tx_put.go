@@ -143,16 +143,25 @@ func (tx *Transaction) putSlice(k []byte, typ reflect.Type, ptr unsafe.Pointer, 
 	valueKind := underlying.Kind()
 	valueSize := underlying.Size()
 
-	// Wipe the entire old slice.
-	if err := tx.Tx.DeletePrefix(k); err != nil {
-		return errors.Wrap(err, "failed to override key")
-	}
-
 	// Keeping this as int64 is possibly slower on 32-bit architecture machines,
 	// but most machines should be 64-bit nowadays.
 	dataPtr, length, _ := defract.SliceInfo(ptr)
 	length64 := int64(length)
 
+	v, err := tx.Tx.Get(k)
+	if err == nil {
+		oldLen, ok := defract.ReadInt64LE(v)
+		if ok && oldLen <= length64 {
+			goto overridden
+		}
+	}
+
+	// Override the previous slice entirely.
+	if err := tx.Tx.DeletePrefix(k); err != nil {
+		return errors.Wrap(err, "failed to clean up old slice")
+	}
+
+overridden:
 	// Write the slice length conveniently into the same buffer as the key.
 	mapKey, lengthValue := tx.kb.AppendExtra(k, nil, 8)
 	mapKey = mapKey[:len(mapKey)-1]
@@ -191,23 +200,16 @@ func (tx *Transaction) putStruct(
 
 	// Verify that the struct schema is the same. If not, wipe everything and
 	// rewrite. If it is, then we don't need to scan the database.
-	needsWipe := true
-	if err := tx.Tx.Get(k, func(v []byte) error {
-		if bytes.Equal(info.RawSchema, v) {
-			needsWipe = false
-		}
-		return nil
-	}); err != nil {
-		return errors.Wrap(err, "failed to get previous struct schema")
+	if v, err := tx.Tx.Get(k); err == nil && bytes.Equal(info.RawSchema, v) {
+		goto afterWipe
 	}
 
-	if needsWipe {
-		// Wipe the entire old map.
-		if err := tx.Tx.DeletePrefix(k); err != nil {
-			return errors.Wrap(err, "failed to override key")
-		}
+	// Wipe the entire old map.
+	if err := tx.Tx.DeletePrefix(k); err != nil {
+		return errors.Wrap(err, "failed to override struct marking key")
 	}
 
+afterWipe:
 	// Indicate that the struct does, in fact, exist, by writing down the known
 	// struct schema.
 	if err := tx.Tx.Put(k, info.RawSchema); err != nil {
