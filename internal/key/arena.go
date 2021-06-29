@@ -71,16 +71,16 @@ func (kb *Arena) AvoidOverflow(key []byte, promised int) []byte {
 	return key
 }
 
-// Append appends data into the given dst byte slice. The dst byte slice's
-// backing must share with buffer, and the data up to buffer's length must not
-// be changed.
-func (kb *Arena) Append(dst, data []byte) []byte {
-	newBuf, _ := kb.AppendExtra(dst, data, 0)
+// Append appends data into the internal byte arena. The dst byte slice's
+// backing array doesn't have to share with buffer. The data up to buffer's
+// length must not be changed.
+func (kb *Arena) Append(head, tail []byte) []byte {
+	newBuf, _ := kb.AppendExtra(head, tail, 0)
 	return newBuf
 }
 
-// AppendExtra appends data into dst while reserving the extra few bytes at the
-// end right after data without any separators. If data is nil, then the
+// AppendExtra appends tail into head while reserving the extra few bytes at the
+// end right after data without any separators. If tail is nil, then the
 // delimiter is right on the left of the extra slice.
 func (kb *Arena) AppendExtra(head, tail []byte, extra int) (newBuf, extraBuf []byte) {
 	if kb.keyBuffer == nil {

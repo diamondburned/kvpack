@@ -34,7 +34,9 @@ runTest:
 		t.Run("value", s.testPutValue)
 	})
 	t.Run("Get", s.testGet)
+	t.Run("Override", s.testOverride)
 	t.Run("Delete", s.testDelete)
+	t.Run("Each", s.testEach)
 
 	// Run the test twice if we're on a Little-Endian machine.
 	if defract.IsLittleEndian {
@@ -66,13 +68,6 @@ type numbers struct {
 	C128 complex128 // LE
 }
 
-type maps struct {
-	Uint map[uint]int
-	Int  map[int]uint
-	F64  map[float64][]byte
-	Strs map[string]string
-}
-
 type quirks struct {
 	BoolNil   *bool     // \x00, \x01, omitted if nil
 	BoolPtr   *bool     // ^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -94,7 +89,6 @@ type animals struct {
 	Quirks   *quirks
 	Strings  []string
 	MoreNums []int
-	Maps     maps
 	junk     string `deep:"-"` // unexpected so ignore
 }
 
@@ -137,28 +131,7 @@ func newTestValue() animals {
 		},
 		Strings:  []string{"Astolfo", "Felix", "idk lol"},
 		MoreNums: []int{1, 2, 3, 4, 2, 0, 6, 9, 10},
-		Maps: maps{
-			Uint: map[uint]int{
-				0:      -1,
-				100000: -100,
-			},
-			Int: map[int]uint{
-				-1:   0,
-				-100: 100000,
-			},
-			F64: map[float64][]byte{
-				// Don't test NaN; it's always unequal, so it's the most useless
-				// map key.
-				math.Inf(+1): []byte("infty"),
-				math.Inf(-1): []byte("neg infty"),
-				-0:           []byte("negative zero?!"),
-			},
-			Strs: map[string]string{
-				"hello": "world",
-				"felix": "argyle",
-			},
-		},
-		junk: "ignore me",
+		junk:     "ignore me",
 	}
 }
 
@@ -166,22 +139,26 @@ func (s suite) testPutPtr(t *testing.T) {
 	testValue := newTestValue()
 
 	// Test db.Put.
-	if err := s.db.Put([]byte("put_ptr"), &testValue); err != nil {
+	if err := s.db.Put([]byte("put_ptr_1"), &testValue); err != nil {
 		t.Error("failed to put &testValue using db.Put:", err)
 	}
-	s.testExpect(t, "put_ptr")
+	s.testExpect(t, "put_ptr_1")
+
+	// Test db.Update.
+	if err := s.db.Update(func(tx *kvpack.Transaction) error {
+		return tx.Put([]byte("put_ptr_2"), &testValue)
+	}); err != nil {
+		t.Error("failed to put testValue using db.Update:", err)
+	}
+	s.testExpect(t, "put_ptr_2")
 }
 
 func (s suite) testPutValue(t *testing.T) {
 	testValue := newTestValue()
 
-	// Test db.Update.
-	if err := s.db.Update(func(tx *kvpack.Transaction) error {
-		return tx.Put([]byte("put_value"), testValue)
-	}); err != nil {
-		t.Error("failed to put testValue using db.Update:", err)
+	if err := s.db.Put([]byte("put_value"), testValue); !errors.Is(err, kvpack.ErrValueNeedsPtr) {
+		t.Fatal("unexpected error putting value:", err)
 	}
-	s.testExpect(t, "put_value")
 }
 
 func (s suite) testExpect(t *testing.T, key string) {
@@ -189,7 +166,8 @@ func (s suite) testExpect(t *testing.T, key string) {
 
 	// n is a helper function for transforming numbers.
 	n := func(v interface{}) string {
-		typ, ptr := defract.UnderlyingPtr(v)
+		ptr := defract.InterfacePtr(v)
+		typ := reflect.TypeOf(v)
 		kind := typ.Kind()
 
 		switch kind {
@@ -208,12 +186,12 @@ func (s suite) testExpect(t *testing.T, key string) {
 		"SoTrue": "\x01",
 
 		"Extincts":             n(int(2)),
-		"Extincts.0":           "",
+		"Extincts.0":           defract.GetStructSchema(extinct{}),
 		"Extincts.0.Dinosaurs": "???",
-		"Extincts.1":           "",
+		"Extincts.1":           defract.GetStructSchema(extinct{}),
 		"Extincts.1.Dodo":      "???",
 
-		"Numbers":      "",
+		"Numbers":      defract.GetStructSchema(numbers{}),
 		"Numbers.Byte": "\x01",
 		"Numbers.Int":  n(int(math.MaxInt)),
 		"Numbers.Uint": n(uint(math.MaxUint)),
@@ -230,11 +208,11 @@ func (s suite) testExpect(t *testing.T, key string) {
 		"Numbers.C64":  n(complex64(5 + 6i)),
 		"Numbers.C128": n(complex128(10 + 12i)),
 
-		"More":      "",
+		"More":      defract.GetStructSchema(animals{}),
 		"More.Cats": "nya nya",
 		"More.Dogs": "wan wan",
 
-		"Quirks":           "",
+		"Quirks":           defract.GetStructSchema(quirks{}),
 		"Quirks.BoolPtr":   "\x00",
 		"Quirks.StructPtr": "",
 		"Quirks.StringPtr": "",
@@ -253,21 +231,6 @@ func (s suite) testExpect(t *testing.T, key string) {
 		"MoreNums.6": n(int(6)),
 		"MoreNums.7": n(int(9)),
 		"MoreNums.8": n(int(10)),
-
-		"Maps":             "",
-		"Maps.Uint":        n(int64(2)),
-		"Maps.Uint.0":      n(int(-1)),
-		"Maps.Uint.100000": n(int(-100)),
-		"Maps.Int":         n(int64(2)),
-		"Maps.Int.-1":      n(uint(0)),
-		"Maps.Int.-100":    n(uint(100000)),
-		"Maps.F64":         n(uint64(3)),
-		"Maps.F64.+Inf":    "infty",
-		"Maps.F64.-Inf":    "neg infty",
-		"Maps.F64.0":       "negative zero?!",
-		"Maps.Strs":        n(int64(2)),
-		"Maps.Strs.hello":  "world",
-		"Maps.Strs.felix":  "argyle",
 	})
 }
 
@@ -275,7 +238,7 @@ func (s suite) testGet(t *testing.T) {
 	accessAssert := func(key string, unmarshal, expect interface{}) {
 		t.Helper()
 
-		if err := s.db.Access(key, unmarshal); err != nil {
+		if err := s.db.GetFields(key, unmarshal); err != nil {
 			t.Fatalf("failed to access %q: %v", key, err)
 		}
 
@@ -289,44 +252,65 @@ func (s suite) testGet(t *testing.T) {
 	expect := newTestValue()
 
 	var gotValue1 animals
-	accessAssert("put_ptr", &gotValue1, &expect)
+	accessAssert("put_ptr_1", &gotValue1, &expect)
 	var gotValue2 animals
-	accessAssert("put_value", &gotValue2, &expect)
+	accessAssert("put_ptr_2", &gotValue2, &expect)
 
 	var gotMoreNums1 numbers
-	accessAssert("put_ptr.Numbers", &gotMoreNums1, &expect.Numbers)
+	accessAssert("put_ptr_1.Numbers", &gotMoreNums1, &expect.Numbers)
 	var gotMoreNums2 numbers
-	accessAssert("put_value.Numbers", &gotMoreNums2, &expect.Numbers)
+	accessAssert("put_ptr_2.Numbers", &gotMoreNums2, &expect.Numbers)
 
 	expectNthNum := 3
 	var nthNum1 int
-	accessAssert("put_ptr.MoreNums.2", &nthNum1, &expectNthNum)
+	accessAssert("put_ptr_1.MoreNums.2", &nthNum1, &expectNthNum)
 	var nthNum2 int
-	accessAssert("put_value.MoreNums.2", &nthNum2, &expectNthNum)
+	accessAssert("put_ptr_2.MoreNums.2", &nthNum2, &expectNthNum)
 
 	var catOutput1 string
-	accessAssert("put_ptr.Cats", &catOutput1, &expect.Cats)
+	accessAssert("put_ptr_1.Cats", &catOutput1, &expect.Cats)
 	var catOutput2 string
-	accessAssert("put_value.Cats", &catOutput2, &expect.Cats)
+	accessAssert("put_ptr_2.Cats", &catOutput2, &expect.Cats)
+
+	stringsOut1 := make([]string, 3)
+	accessAssert("put_ptr_1.Strings", &stringsOut1, &expect.Strings)
+	stringsOut2 := make([]string, 3)
+	accessAssert("put_ptr_2.Strings", &stringsOut2, &expect.Strings)
 
 	toBytesPtr := func(s string) *[]byte {
 		v := []byte(s)
 		return &v
 	}
 	var catOutput3 []byte
-	accessAssert("put_ptr.Cats", &catOutput3, toBytesPtr(expect.Cats))
+	accessAssert("put_ptr_1.Cats", &catOutput3, toBytesPtr(expect.Cats))
 	var catOutput4 []byte
-	accessAssert("put_value.Cats", &catOutput4, toBytesPtr(expect.Cats))
+	accessAssert("put_ptr_2.Cats", &catOutput4, toBytesPtr(expect.Cats))
+}
 
-	expectMapPtr := map[string]string{
-		"junk":  "delete me",
-		"hello": "world",
-		"felix": "argyle",
+// dummyTestType is a made-up new type to ensure that things are cleaned up
+// properly.
+type dummyTestType struct {
+	Nothing string
+}
+
+func (s suite) testOverride(t *testing.T) {
+	dummyValue := dummyTestType{"absolutely nothing"}
+	type input struct {
+		key string
+		val interface{}
 	}
-	outputMapPtr1 := map[string]string{"junk": "delete me"}
-	accessAssert("put_ptr.Maps.Strs", &outputMapPtr1, &expectMapPtr)
-	outputMapPtr2 := map[string]string{"junk": "delete me"}
-	accessAssert("put_value.Maps.Strs", &outputMapPtr2, &expectMapPtr)
+
+	inputs := []input{{"put_ptr_1", &dummyValue}, {"put_value_2", &dummyValue}}
+
+	for _, input := range inputs {
+		if err := s.db.Put([]byte(input.key), input.val); err != nil {
+			t.Error("failed to override put_ptr:", err)
+		}
+
+		s.Expect(t, input.key, map[string]string{
+			"Nothing": "absolutely nothing",
+		})
+	}
 }
 
 func (s suite) testDelete(t *testing.T) {
@@ -385,6 +369,8 @@ func (s suite) makeKey(midKey, tailKey string) string {
 func (s suite) Expect(t *testing.T, key string, o map[string]string) {
 	t.Helper()
 
+	key = strings.ReplaceAll(key, ".", kvpack.Separator)
+
 	rootKey := s.db.Namespace() + kvpack.Separator + key
 	dump := make(map[string]string)
 
@@ -426,5 +412,51 @@ func (s suite) Expect(t *testing.T, key string, o map[string]string) {
 
 	for k, v := range dump {
 		t.Errorf("excess key %q value %q", k, v)
+	}
+}
+
+func (s suite) testEach(t *testing.T) {
+	mustPut := func(k string, v interface{}) {
+		if err := s.db.PutFields(k, v); err != nil {
+			t.Fatalf("failed to put key %q: %v", k, err)
+		}
+	}
+
+	mustPut("each.extincts", "") // satisfy s.Expect
+	mustPut("each.extincts.dinosaurs", &extinct{Dinosaurs: "???"})
+	mustPut("each.extincts.dodo", &extinct{Dodo: "???"})
+
+	s.Expect(t, "each.extincts", map[string]string{
+		"dinosaurs":           defract.GetStructSchema(extinct{}),
+		"dinosaurs.Dinosaurs": "???",
+
+		"dodo":      defract.GetStructSchema(extinct{}),
+		"dodo.Dodo": "???",
+	})
+
+	expects := map[string]extinct{
+		"dinosaurs": extinct{Dinosaurs: "???"},
+		"dodo":      extinct{Dodo: "???"},
+	}
+
+	var dst extinct
+	err := s.db.Each("each.extincts", &dst, func(k []byte) (br bool) {
+		expect, ok := expects[string(k)]
+		if !ok {
+			t.Fatalf("unexpected Each key %q", k)
+			return true
+		}
+
+		if expect != dst {
+			t.Errorf("unexpected dst\n"+
+				"expected %#v\n"+
+				"got      %#v", expect, dst)
+		}
+
+		return false
+	})
+
+	if err != nil {
+		t.Fatal("failed to Each:", err)
 	}
 }

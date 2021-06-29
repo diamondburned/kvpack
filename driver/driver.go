@@ -35,3 +35,22 @@ type Transaction interface {
 	// It is used for iterating over maps and optionally arrays.
 	Iterate(prefix []byte, fn func(k, v []byte) error) error
 }
+
+// KeyIterator is similar to Transaction's Iterate method, except only the key
+// is iterated over.
+type KeyIterator interface {
+	IterateKey(prefix []byte, fn func(k []byte) error) error
+}
+
+// Preloader is an optional interface that a transaction can implement that
+// preloads all keys and values with the given prefix.
+type Preloader interface {
+	// Preload preloads all keys and values with the given prefix. Preload
+	// errors should be silently discarded. Implementations don't need to update
+	// the cache on Put; users expecting such a behavior is not good.
+	Preload(prefix []byte)
+	// Unload wipes the preloaded cache of all keys with the given prefix. This
+	// is usually called by the handler to ensure that cache invalidation can be
+	// done trivially. Like Preload, errors should be silently ignored.
+	Unload(prefix []byte)
+}

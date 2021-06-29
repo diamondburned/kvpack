@@ -160,6 +160,33 @@ func (tx *Transaction) Iterate(prefix []byte, fn func(k, v []byte) error) error 
 	return nil
 }
 
+// IterateKey iterates over all keys with the given prefix in lexicographic
+// order.
+func (tx *Transaction) IterateKey(prefix []byte, fn func(k []byte) error) error {
+	for _, pair := range tx.tmp {
+		if bytes.HasPrefix(pair[0], prefix) {
+			if err := fn(pair[0]); err != nil {
+				return err
+			}
+		}
+	}
+
+	prefixString := string(prefix)
+
+	tx.db.m.RLock()
+	defer tx.db.m.RUnlock()
+
+	for k := range tx.db.v {
+		if strings.HasPrefix(k, prefixString) {
+			if err := fn([]byte(k)); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 // DeletePrefix registers the given prefix to be deleted once committed.
 func (tx *Transaction) DeletePrefix(prefix []byte) error {
 	if tx.isRO() {

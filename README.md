@@ -14,3 +14,18 @@ internally, the API surface should always be kept simple.
 
 Because of this, kvpack will not read any struct tags. The API surface will
 always be kept to a bare minimum.
+
+## Supported Types
+
+The following kinds of types are supported:
+
+- Slices
+- Strings
+- Booleans
+- All numbers (uint?, int?, float?, complex?, etc.)
+- Structs
+
+The following kinds of types are **not** supported:
+
+- Maps, because they're too complicated
+- Arrays (TODO)

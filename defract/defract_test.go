@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/go-test/deep"
 )
 
 type mockType string
@@ -20,6 +22,8 @@ func TestUnderlyingPtr(t *testing.T) {
 	const sample = "Hello, 世界"
 
 	eqType := func(t *testing.T, typ, expect reflect.Type) {
+		t.Helper()
+
 		if typ != expect {
 			t.Error("expected type string, got", typ)
 		}
@@ -27,6 +31,8 @@ func TestUnderlyingPtr(t *testing.T) {
 
 	// eq verifies the backing array.
 	eq := func(t *testing.T, ptr unsafe.Pointer) {
+		t.Helper()
+
 		var (
 			length  = (*reflect.StringHeader)(ptr).Len
 			pointer = unsafe.Pointer((*reflect.StringHeader)(ptr).Data)
@@ -62,16 +68,34 @@ func TestUnderlyingPtr(t *testing.T) {
 		}
 	})
 
+	t.Run("0-level", func(t *testing.T) {
+		typ, got := UnderlyingPtr(sample)
+		if got != nil {
+			t.Fatal("unexpected non-nil ptr returned from nil")
+		}
+		if typ != nil {
+			t.Fatal("unexpected type non-nil")
+		}
+	})
+
+	t.Run("method-0-level", func(t *testing.T) {
+		typ, got := UnderlyingPtr(mockType(sample))
+		if got != nil {
+			t.Fatal("unexpected non-nil ptr returned from nil")
+		}
+		if typ != nil {
+			t.Fatal("unexpected type non-nil")
+		}
+	})
+
 	check := func(t *testing.T, v, expectTyp interface{}) {
+		t.Helper()
+
 		typ, got := UnderlyingPtr(v)
 		eqType(t, typ, reflect.TypeOf(expectTyp))
 		eq(t, got)
 	}
 
-	t.Run("0-level", func(t *testing.T) {
-		str := sample
-		check(t, str, sample)
-	})
 	t.Run("1-level", func(t *testing.T) {
 		str := sample
 		check(t, &str, sample)
@@ -82,10 +106,6 @@ func TestUnderlyingPtr(t *testing.T) {
 		check(t, &ptr, sample)
 	})
 
-	t.Run("method-0-level", func(t *testing.T) {
-		str := mockType(sample)
-		check(t, str, mockType(""))
-	})
 	t.Run("method-1-level", func(t *testing.T) {
 		str := mockType(sample)
 		check(t, &str, mockType(""))
@@ -247,7 +267,8 @@ func TestNumberLE(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		typ, ptr := UnderlyingPtr(test)
+		ptr := InterfacePtr(test)
+		typ := reflect.TypeOf(test)
 
 		IsLittleEndian = true
 		le := NumberLE(typ.Kind(), ptr)
@@ -282,5 +303,79 @@ func TestNumberLE(t *testing.T) {
 				t.Fatalf("ReadNumberLE Big Endian output differs: %v != %v", v, test)
 			}
 		}
+	}
+}
+
+type testStruct struct {
+	Field1  string
+	Field2  string
+	Foo     int
+	Bar     int
+	Astolfo anotherStruct
+}
+
+type anotherStruct struct {
+	Astolfo string
+}
+
+func TestStructInfo(t *testing.T) {
+	expect := StructInfo{
+		Type:      reflect.TypeOf(testStruct{}),
+		RawSchema: []byte("Field1\x00Field2\x00Foo\x00Bar\x00Astolfo"),
+		Fields: []StructField{
+			{
+				Type:   reflect.TypeOf(""),
+				Kind:   reflect.String,
+				Name:   []byte("Field1"),
+				Size:   2 * unsafe.Sizeof(0),
+				Offset: 0,
+			},
+			{
+				Type:   reflect.TypeOf(""),
+				Kind:   reflect.String,
+				Name:   []byte("Field2"),
+				Size:   2 * unsafe.Sizeof(0),
+				Offset: 2 * unsafe.Sizeof(0),
+			},
+			{
+				Type:   reflect.TypeOf(int(0)),
+				Kind:   reflect.Int,
+				Name:   []byte("Foo"),
+				Size:   unsafe.Sizeof(0),
+				Offset: 4 * unsafe.Sizeof(0),
+			},
+			{
+				Type:   reflect.TypeOf(int(0)),
+				Kind:   reflect.Int,
+				Name:   []byte("Bar"),
+				Size:   unsafe.Sizeof(0),
+				Offset: 5 * unsafe.Sizeof(0),
+			},
+			{
+				Type: reflect.TypeOf(anotherStruct{}),
+				Kind: reflect.Struct,
+				ChildStruct: &StructInfo{
+					Type:      reflect.TypeOf(anotherStruct{}),
+					RawSchema: []byte("Astolfo"),
+					Fields: []StructField{
+						{
+							Type: reflect.TypeOf(""),
+							Kind: reflect.String,
+							Name: []byte("Astolfo"),
+							Size: 2 * unsafe.Sizeof(0),
+						},
+					},
+				},
+				Name:   []byte("Astolfo"),
+				Size:   2 * unsafe.Sizeof(0),
+				Offset: 6 * unsafe.Sizeof(0),
+			},
+		},
+	}
+
+	got := GetStructInfo(reflect.TypeOf(testStruct{}))
+
+	for _, ineq := range deep.Equal(&expect, got) {
+		t.Errorf("expect/got: %q", ineq)
 	}
 }

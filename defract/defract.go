@@ -3,6 +3,7 @@
 package defract
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
 	"reflect"
@@ -344,6 +345,10 @@ var (
 type StructInfo struct {
 	Type   reflect.Type
 	Fields []StructField
+
+	// RawSchema describes the schema of the struct. The description currently
+	// includes field names, though this may change in the future.
+	RawSchema []byte
 }
 
 type StructField struct {
@@ -362,6 +367,18 @@ type StructField struct {
 	Indirect bool
 }
 
+// GetStructSchema gets the struct schema of the given struct value's type. If v
+// isn't a struct, then it panics.
+func GetStructSchema(v interface{}) string {
+	typ := reflect.TypeOf(v)
+	if typ.Kind() != reflect.Struct {
+		panic("given value to GetStructSchema is not a struct")
+	}
+
+	info := GetStructInfo(typ)
+	return string(info.RawSchema)
+}
+
 // GetStructInfo returns the struct type information for the given struct value.
 // It assumes that typ is a type of a struct and does not do checks.
 func GetStructInfo(typ reflect.Type) *StructInfo {
@@ -369,10 +386,10 @@ func GetStructInfo(typ reflect.Type) *StructInfo {
 	// the value pointer. The type pointer is most likely *rtype, but we don't
 	// care about that. Instead, we care about the pointer value of that type,
 	// which is the value pointer. This allows us to access the map faster.
-	ptr := InterfacePtr(typ)
+	iface := (*_iface)(unsafe.Pointer(&typ))
 
 	structMutex.RLock()
-	v, ok := structCache[ptr]
+	v, ok := structCache[iface.p]
 	structMutex.RUnlock()
 	if ok {
 		return v
@@ -398,7 +415,7 @@ func GetStructInfo(typ reflect.Type) *StructInfo {
 		info.get(typ)
 
 		structMutex.Lock()
-		structCache[ptr] = &info
+		structCache[iface.p] = &info
 		structMutex.Unlock()
 		return &info, nil
 	})
@@ -445,6 +462,33 @@ func (info *StructInfo) get(typ reflect.Type) {
 			}
 		}
 	}
+
+	// Render the raw schema.
+	var schemaLen int
+
+	for i, field := range info.Fields {
+		schemaLen += len(field.Name)
+		if i != 0 {
+			schemaLen++ // account for the \0 delimiter
+		}
+	}
+
+	rawSchema := bytes.NewBuffer(nil)
+	rawSchema.Grow(schemaLen)
+
+	for i, field := range info.Fields {
+		if len(field.Name) == 0 {
+			continue
+		}
+
+		if i != 0 {
+			rawSchema.WriteByte('\x00')
+		}
+		rawSchema.Write(field.Name)
+	}
+
+	// Reset the slice in case rawSchema grew for whatever reason.
+	info.RawSchema = rawSchema.Bytes()
 }
 
 type _iface struct {
@@ -470,6 +514,9 @@ func UnderlyingPtr(v interface{}) (reflect.Type, unsafe.Pointer) {
 	}
 
 	typ := reflect.TypeOf(v)
+	if typ.Kind() != reflect.Ptr {
+		return nil, nil
+	}
 
 	var dereferenced bool
 
@@ -579,6 +626,12 @@ func SliceSetLen(ptr unsafe.Pointer, len int64) unsafe.Pointer {
 func BytesToStr(bytes []byte) string {
 	// []byte is a larger structure than string, so this is fine.
 	return *(*string)(unsafe.Pointer(&bytes))
+}
+
+// StrToBytes converts the given string to bytes without copying.
+func StrToBytes(str *string) []byte {
+	h := (*StringHeader)(unsafe.Pointer(str))
+	return unsafe.Slice((*byte)(h.Data), h.Len)
 }
 
 // CopyString tries to reduce allocations by reusing the backing array if

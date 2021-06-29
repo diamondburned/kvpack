@@ -24,9 +24,24 @@ var ErrTooRecursed = errors.New("kvpack recursed too deep (> 1024)")
 // being performed.
 var ErrReadOnly = errors.New("transaction is read-only")
 
-// Transaction describes a transaction of a database managed by kvpack.
+// ErrValueNeedsPtr is returned if the given value is not a pointer. This is
+// required to handle pointers around in a sane way internally, so it is
+// required of both Get and Put.
+var ErrValueNeedsPtr = errors.New("given value must be a non-nil pointer")
+
+// Transaction describes a transaction of a database managed by kvpack. A
+// transaction must not be shared across goroutines, as it is not concurrently
+// safe. To work around this, create multiple transactions.
 type Transaction struct {
 	Tx driver.Transaction
+
+	lazy struct {
+		preloader   driver.Preloader
+		preloaderOK bool
+
+		keyIterator   driver.KeyIterator
+		keyIteratorOK bool
+	}
 
 	kb key.Arena
 	ns int
@@ -80,6 +95,30 @@ func (tx *Transaction) Delete(k []byte) error {
 
 	key := tx.kb.Append(tx.namespace(), k)
 	return tx.Tx.DeletePrefix(key)
+}
+
+// Delete deletes the value with the given dot-syntax key.
+func (tx *Transaction) DeleteFields(fields string) error {
+	if tx.ro {
+		return ErrReadOnly
+	}
+
+	key := tx.makeFieldsKey(fields)
+	return tx.Tx.DeletePrefix(key)
+}
+
+func (tx *Transaction) makeFieldsKey(fields string) []byte {
+	key := tx.kb.Append(tx.namespace(), []byte(fields))
+	// Replace all periods with the right separator.
+	for i := len(tx.namespace()); i < len(key); i++ {
+		if key[i] == '.' {
+			// We know that separator is a single character, which makes this a
+			// lot easier. Had it been more than one, this wouldn't work.
+			key[i] = Separator[0]
+		}
+	}
+
+	return key
 }
 
 // namespace returns the namespace from the shared buffer.
@@ -152,17 +191,17 @@ func (db *Database) Update(f func(*Transaction) error) error {
 	return tx.Commit()
 }
 
-// Access gets the given dot-syntax key and unmarshals its value into the given
-// pointer in a single read-only transaction. For more information, see
-// Transaction's Access.
-func (db *Database) Access(k string, v interface{}) error {
+// GetFields gets the given dot-syntax key and unmarshals its value into the
+// given pointer in a single read-only transaction. For more information, see
+// Transaction's GetFields.
+func (db *Database) GetFields(fields string, v interface{}) error {
 	tx, err := db.Begin(true)
 	if err != nil {
 		return errors.Wrap(err, "failed to start transaction")
 	}
 	defer tx.Rollback()
 
-	if err := tx.Access(k, v); err != nil {
+	if err := tx.GetFields(fields, v); err != nil {
 		return errors.Wrap(err, "failed to get")
 	}
 
@@ -180,6 +219,26 @@ func (db *Database) Get(k []byte, v interface{}) error {
 
 	if err := tx.Get(k, v); err != nil {
 		return errors.Wrap(err, "failed to get")
+	}
+
+	return nil
+}
+
+// PutFields puts the given value into the database with the given dot-syntax
+// key in a single transaction.
+func (db *Database) PutFields(fields string, v interface{}) error {
+	tx, err := db.Begin(false)
+	if err != nil {
+		return errors.Wrap(err, "failed to start transaction")
+	}
+	defer tx.Rollback()
+
+	if err := tx.PutFields(fields, v); err != nil {
+		return errors.Wrap(err, "failed to put")
+	}
+
+	if err := tx.Commit(); err != nil {
+		return errors.Wrap(err, "failed to commit")
 	}
 
 	return nil
@@ -219,6 +278,42 @@ func (db *Database) Delete(prefix []byte) error {
 
 	if err := tx.Commit(); err != nil {
 		return errors.Wrap(err, "failed to commit")
+	}
+
+	return nil
+}
+
+// Delete deletes the given dot-syntax prefix from the database in a single
+// transaction.
+func (db *Database) DeleteFields(fields string) error {
+	tx, err := db.Begin(false)
+	if err != nil {
+		return errors.Wrap(err, "failed to start transaction")
+	}
+	defer tx.Rollback()
+
+	if err := tx.DeleteFields(fields); err != nil {
+		return errors.Wrap(err, "failed to put")
+	}
+
+	if err := tx.Commit(); err != nil {
+		return errors.Wrap(err, "failed to commit")
+	}
+
+	return nil
+}
+
+// Each iterates over the dot-syntax fields key from the database in a single
+// transaction. Refer to Transaction's Each for more documentation.
+func (db *Database) Each(fields string, v interface{}, eachFn func(k []byte) (done bool)) error {
+	tx, err := db.Begin(true)
+	if err != nil {
+		return errors.Wrap(err, "failed to start transaction")
+	}
+	defer tx.Rollback()
+
+	if err := tx.Each(fields, v, eachFn); err != nil {
+		return errors.Wrap(err, "failed to get")
 	}
 
 	return nil

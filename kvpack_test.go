@@ -1,6 +1,7 @@
 package kvpack
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -47,7 +48,7 @@ func TestNilParams(t *testing.T) {
 	}}
 	tx := NewTransaction(mn, "a", false)
 
-	if err := tx.Put([]byte("key"), nil); err != nil {
+	if err := tx.Put([]byte("key"), nil); !errors.Is(err, ErrValueNeedsPtr) {
 		t.Fatal("unexpected error putting nil value:", err)
 	}
 
@@ -56,7 +57,7 @@ func TestNilParams(t *testing.T) {
 	}
 
 	// Put any typed nil value.
-	if err := tx.Put([]byte("other"), (*miniTx)(nil)); err != nil {
+	if err := tx.Put([]byte("other"), (*miniTx)(nil)); !errors.Is(err, ErrValueNeedsPtr) {
 		t.Fatal("unexpected error putting typed nil value:", err)
 	}
 

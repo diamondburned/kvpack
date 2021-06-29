@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/diamondburned/kvpack/defract"
+	"github.com/diamondburned/kvpack/driver"
 	"github.com/pkg/errors"
 )
 
@@ -20,22 +21,21 @@ func (tx *Transaction) Get(k []byte, v interface{}) error {
 	return tx.get(tx.kb.Append(tx.namespace(), k), v)
 }
 
-// Access is a convenient function around Get that accesses struct or struct
+// GetFields is a convenient function around Get that accesses struct or struct
 // fields using the period syntax. Each field inside the given fields string is
 // delimited by a period, for example, "raining.Cats.Dogs", where "raining" is
 // the key.
-func (tx *Transaction) Access(fields string, v interface{}) error {
-	key := tx.kb.Append(tx.namespace(), []byte(fields))
-	// Replace all periods with the right separator.
-	for i := len(tx.namespace()); i < len(key); i++ {
-		if key[i] == '.' {
-			// We know that separator is a single character, which makes this a
-			// lot easier. Had it been more than one, this wouldn't work.
-			key[i] = Separator[0]
-		}
+func (tx *Transaction) GetFields(fields string, v interface{}) error {
+	return tx.get(tx.makeFieldsKey(fields), v)
+}
+
+func (tx *Transaction) preloader() driver.Preloader {
+	if !tx.lazy.preloaderOK {
+		tx.lazy.preloader, _ = tx.Tx.(driver.Preloader)
+		tx.lazy.preloaderOK = true
 	}
 
-	return tx.get(key, v)
+	return tx.lazy.preloader
 }
 
 func (tx *Transaction) get(k []byte, v interface{}) error {
@@ -74,14 +74,105 @@ func (tx *Transaction) get(k []byte, v interface{}) error {
 		return err
 	}
 
-	if reflect.TypeOf(v).Kind() != reflect.Ptr {
-		return errors.New("given interface out value is not a pointer")
+	typ, ptr := defract.UnderlyingPtr(v)
+	if typ == nil {
+		return ErrValueNeedsPtr
 	}
 
-	typ, ptr := defract.UnderlyingPtr(v)
-	kind := typ.Kind()
+	// Optionally preload the whole prefix if possible.
+	if preloader := tx.preloader(); preloader != nil {
+		preloader.Preload(k)
+		defer preloader.Unload(k)
+	}
 
-	return tx.getValue(k, typ, kind, ptr, 0)
+	return tx.getValue(k, typ, typ.Kind(), ptr, 0)
+}
+
+func (tx *Transaction) keyIterator() driver.KeyIterator {
+	if !tx.lazy.keyIteratorOK {
+		tx.lazy.keyIterator, _ = tx.Tx.(driver.KeyIterator)
+		tx.lazy.keyIteratorOK = true
+	}
+
+	return tx.lazy.keyIterator
+}
+
+var internEachBreak = errors.New("break each")
+
+// Each iterates over each instance of the given dot-syntax fields key and calls
+// the eachFn callback on each iteration. The callback must capture the pointer
+// passed in, and it must not move or take any of the fields inside the given
+// value until Each exits. The callback must also not take the given key away;
+// it has to copy it into a new slice.
+//
+// The order of iteration is undefined and unguaranteed by kvpack, however, that
+// is entirely up to the driver and its order of iteration. Refer to the
+// driver's documentation if possible.
+//
+// Below is an example with error checking omitted for brevity:
+//
+//    tx.PutFields("app.users.1", User{Name: "don't need this user"})
+//    tx.PutFields("app.users.2", User{Name: "don't need this user either"})
+//    tx.PutFields("app.users.3", User{Name: "need this user"})
+//    tx.PutFields("app.users.4", User{Name: "but not this user"})
+//
+//    var user User
+//    return &user, tx.Each("app.users", &user, func(k []byte) bool {
+//        log.Println("found user with ID", string(k))
+//        return user.Name == "need this user"
+//    })
+//
+func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) (done bool)) error {
+	var key []byte
+	key = tx.makeFieldsKey(fields)
+	key = tx.kb.Append(key, nil) // ensure trailing separator
+
+	typ, ptr := defract.UnderlyingPtr(v)
+	if typ == nil {
+		return ErrValueNeedsPtr
+	}
+
+	onEach := func(k []byte) error {
+		fieldKey := bytes.TrimPrefix(k, key)
+
+		// Ensure that this is the key we expect by verifying that it only has
+		// one part.
+		if bytes.Contains(fieldKey, []byte(Separator)) {
+			return nil
+		}
+
+		// Optionally preload the whole prefix if possible.
+		if preloader := tx.preloader(); preloader != nil {
+			preloader.Preload(k)
+			defer preloader.Unload(k)
+		}
+
+		// Wipe the underlying value before we write to it.
+		defract.ZeroOut(ptr, typ.Size())
+
+		if err := tx.getValue(k, typ, typ.Kind(), ptr, 1); err != nil {
+			return err
+		}
+
+		if eachFn(fieldKey) {
+			return internEachBreak
+		}
+
+		return nil
+	}
+
+	var err error
+	if it := tx.keyIterator(); it != nil {
+		err = it.IterateKey(key, onEach)
+	} else {
+		err = tx.Tx.Iterate(key, func(k, _ []byte) error { return onEach(k) })
+	}
+
+	if err != nil && errors.Is(err, internEachBreak) {
+		return nil
+	}
+
+	return err
 }
 
 func (tx *Transaction) getValue(
@@ -117,7 +208,7 @@ func (tx *Transaction) getValueBytes(
 	switch kind := typ.Kind(); kind {
 	case reflect.Bool:
 		if len(b) == 0 {
-			return io.ErrUnexpectedEOF
+			return errors.Wrap(io.ErrUnexpectedEOF, "error parsing bool")
 		}
 
 		// A bool can probably be treated as 1 byte, so we can check the first
@@ -132,7 +223,7 @@ func (tx *Transaction) getValueBytes(
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 
 		if !defract.ReadNumberLE(b, kind, ptr) {
-			return io.ErrUnexpectedEOF
+			return errors.Wrap(io.ErrUnexpectedEOF, "error parsing "+kind.String())
 		}
 		return nil
 
@@ -162,9 +253,6 @@ func (tx *Transaction) getValueBytes(
 
 	case reflect.Struct:
 		return tx.getStruct(k, defract.GetStructInfo(typ), ptr, rec+1)
-
-	case reflect.Map:
-		return tx.getMap(k, b, typ, ptr, rec+1)
 	}
 
 	return fmt.Errorf("unknown type %s", typ)
@@ -179,9 +267,12 @@ func (tx *Transaction) getSlice(
 
 	length64, ok := defract.ReadInt64LE(lenBytes)
 	if !ok {
-		return io.ErrUnexpectedEOF
+		return errors.Wrapf(io.ErrUnexpectedEOF, "error reading slice length at key %q", k)
 	}
-	if length64 <= 0 {
+	if length64 == 0 {
+		return nil
+	}
+	if length64 < 0 {
 		return fmt.Errorf("length %d (%q) is invalid", length64, lenBytes)
 	}
 
@@ -236,124 +327,4 @@ func (tx *Transaction) getStruct(
 	}
 
 	return nil
-}
-
-func (tx *Transaction) getMap(
-	k, lenBytes []byte, typ reflect.Type, ptr unsafe.Pointer, rec int) error {
-
-	length64, ok := defract.ReadInt64LE(lenBytes)
-	if !ok {
-		return io.ErrUnexpectedEOF
-	}
-
-	keyType := typ.Key()
-	valueType := typ.Elem()
-	valueKind := valueType.Kind()
-
-	// Allocate a new temporary value to be written into and copied from.
-	tmpKey := reflect.New(keyType)
-	tmpKeyPtr := unsafe.Pointer(tmpKey.Pointer())
-
-	// Dereference the value for reading.
-	tmpKey = tmpKey.Elem()
-
-	// keyer gets the reflect.Value's underlying pointer and returns the key.
-	// The callback must set the value into tmpValue or tmpPtr.
-	var keyer func([]byte) error
-
-	switch kind := keyType.Kind(); kind {
-	case reflect.Float32, reflect.Float64:
-		keyer = func(b []byte) error {
-			f, err := strconv.ParseFloat(defract.BytesToStr(b), 64)
-			if err != nil {
-				return err
-			}
-			tmpKey.SetFloat(f)
-			return nil
-		}
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		var bitSize int
-		switch kind {
-		case reflect.Int, reflect.Int64:
-			bitSize = 64
-		case reflect.Int32:
-			bitSize = 32
-		case reflect.Int16:
-			bitSize = 16
-		case reflect.Int8:
-			bitSize = 8
-		}
-		keyer = func(b []byte) error {
-			i, err := strconv.ParseInt(defract.BytesToStr(b), 10, bitSize)
-			if err != nil {
-				return err
-			}
-			tmpKey.SetInt(i)
-			return nil
-		}
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		var bitSize int
-		switch kind {
-		case reflect.Uint, reflect.Uint64:
-			bitSize = 64
-		case reflect.Uint32:
-			bitSize = 32
-		case reflect.Uint16:
-			bitSize = 16
-		case reflect.Uint8:
-			bitSize = 8
-		}
-		keyer = func(b []byte) error {
-			u, err := strconv.ParseUint(defract.BytesToStr(b), 10, bitSize)
-			if err != nil {
-				return err
-			}
-			tmpKey.SetUint(u)
-			return nil
-		}
-	case reflect.String:
-		keyer = func(b []byte) error {
-			// Always allocate a new string here, since strings use a reference
-			// backing array too.
-			*(*string)(tmpKeyPtr) = *(*string)(unsafe.Pointer(&b))
-			return nil
-		}
-	default:
-		return fmt.Errorf("unsupported key type %s", keyType)
-	}
-
-	var mapValue reflect.Value
-
-	if mapPtr := (*unsafe.Pointer)(ptr); *mapPtr == nil {
-		// Current map is nil. Allocate a new map with the exact length. I
-		// probably won't even bother to reuse the old map.
-		mapValue = reflect.MakeMapWithSize(typ, int(length64))
-		// Set this new map in.
-		*mapPtr = unsafe.Pointer(mapValue.Pointer())
-	} else {
-		// Else, reuse the existing map.
-		mapValue = reflect.NewAt(typ, ptr).Elem()
-	}
-
-	dbPrefix := tx.kb.Append(k, nil)
-
-	return tx.Tx.Iterate(dbPrefix, func(k, v []byte) error {
-		mapKey := k[len(dbPrefix):]
-		if err := keyer(mapKey); err != nil {
-			return errors.Wrapf(err, "key error at key %q", mapKey)
-		}
-
-		// Values may be pointers (e.g. slices), so allocate a new value for
-		// each.
-		// Allocate a temporary value for the map value as well.
-		tmpValue := reflect.New(valueType)
-		tmpValuePtr := unsafe.Pointer(tmpValue.Pointer())
-
-		if err := tx.getValueBytes(k, v, valueType, valueKind, tmpValuePtr, rec+1); err != nil {
-			return errors.Wrapf(err, "value error at key %q", mapKey)
-		}
-
-		mapValue.SetMapIndex(tmpKey, tmpValue.Elem())
-		return nil
-	})
 }

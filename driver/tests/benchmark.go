@@ -37,9 +37,6 @@ func DoBenchmark(b *testing.B, db *kvpack.Database) {
 	b.Run("PutKVPack", ber.benchmarkPutKVPack)
 	b.Run("PutJSON", ber.benchmarkPutJSON)
 
-	b.Run("PutKVPackMap", ber.benchmarkPutKVPackMap)
-	b.Run("PutJSONMap", ber.benchmarkPutJSONMap)
-
 	b.Run("GetKVPack", ber.benchmarkGetKVPack)
 	b.Run("GetJSON", ber.benchmarkGetJSON)
 }
@@ -71,7 +68,7 @@ func (ber *benchmarker) benchmarkPutJSON(b *testing.B) {
 			b.Fatal("failed to encode:", err)
 		}
 
-		if err := ber.db.Put(k, j); err != nil {
+		if err := ber.db.Put(k, &j); err != nil {
 			b.Fatal("failed to put:", err)
 		}
 	}
@@ -81,7 +78,7 @@ func (ber *benchmarker) benchmarkGetKVPack(b *testing.B) {
 	k := []byte("benchmark_get_kvpack")
 	v := benchmarkStruct{}
 
-	if err := ber.db.Put(k, benchmarkValue); err != nil {
+	if err := ber.db.Put(k, &benchmarkValue); err != nil {
 		b.Fatal("failed to put:", err)
 	}
 
@@ -99,12 +96,12 @@ func (ber *benchmarker) benchmarkGetJSON(b *testing.B) {
 	k := []byte("benchmark_get_json")
 	v := benchmarkStruct{}
 
-	jsonData, err := json.Marshal(benchmarkValue)
+	jsonData, err := json.Marshal(&benchmarkValue)
 	if err != nil {
 		b.Fatal("failed to encode:", err)
 	}
 
-	if err := ber.db.Put(k, jsonData); err != nil {
+	if err := ber.db.Put(k, &jsonData); err != nil {
 		b.Fatal("failed to put:", err)
 	}
 
@@ -120,55 +117,6 @@ func (ber *benchmarker) benchmarkGetJSON(b *testing.B) {
 
 		if err := json.Unmarshal(output, &v); err != nil {
 			b.Fatal("failed to decode:", err)
-		}
-	}
-}
-
-type benchmarkMapType struct {
-	Name string
-	Data map[string]string
-}
-
-func newBenchmarkMapSample() *benchmarkMapType {
-	return &benchmarkMapType{
-		Name: "Astolfo",
-		Data: map[string]string{
-			"gender": "???",
-			"height": "164cm",
-			"weight": "56kg",
-		},
-	}
-}
-
-func (ber *benchmarker) benchmarkPutKVPackMap(b *testing.B) {
-	k := []byte("benchmark_put_kvpack_map")
-	v := newBenchmarkMapSample()
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		if err := ber.db.Put(k, &v); err != nil {
-			b.Fatal("failed to put:", err)
-		}
-	}
-}
-
-func (ber *benchmarker) benchmarkPutJSONMap(b *testing.B) {
-	k := []byte("benchmark_put_json_map")
-	v := newBenchmarkMapSample()
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		j, err := json.Marshal(v)
-		if err != nil {
-			b.Fatal("failed to encode:", err)
-		}
-
-		if err := ber.db.Put(k, j); err != nil {
-			b.Fatal("failed to put:", err)
 		}
 	}
 }

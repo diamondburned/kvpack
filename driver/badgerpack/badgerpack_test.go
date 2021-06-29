@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/options"
 	"github.com/diamondburned/kvpack"
 	"github.com/diamondburned/kvpack/driver/tests"
 )
@@ -12,6 +13,7 @@ func mustOpenInMemory(tb testing.TB, namespace string) *kvpack.Database {
 	opts := badger.DefaultOptions("")
 	opts.Logger = nil
 	opts.InMemory = true
+	opts.Compression = options.None
 
 	d, err := Open(namespace, opts)
 	if err != nil {
