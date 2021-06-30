@@ -61,21 +61,6 @@ func isZeroBenchmark(b *testing.B, fn func([]byte) bool) {
 			}
 		})
 	}
-
-	for _, bench := range isZeroSamples() {
-		b.Run(bench.name+"_parallel", func(b *testing.B) {
-			b.SetBytes(int64(len(bench.data)))
-			b.ResetTimer()
-
-			b.RunParallel(func(pb *testing.PB) {
-				for pb.Next() {
-					if fn(bench.data) {
-						b.Fatal("unexpected byte equal")
-					}
-				}
-			})
-		})
-	}
 }
 
 func BenchmarkIsZeroStreq(b *testing.B) {

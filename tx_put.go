@@ -201,7 +201,7 @@ func (tx *Transaction) putStruct(
 	// Verify that the struct schema is the same. If not, wipe everything and
 	// rewrite. If it is, then we don't need to scan the database.
 	if v, err := tx.Tx.Get(k); err == nil && bytes.Equal(info.RawSchema, v) {
-		goto afterWipe
+		goto sameSchema
 	}
 
 	// Wipe the entire old map.
@@ -209,13 +209,13 @@ func (tx *Transaction) putStruct(
 		return errors.Wrap(err, "failed to override struct marking key")
 	}
 
-afterWipe:
 	// Indicate that the struct does, in fact, exist, by writing down the known
 	// struct schema.
 	if err := tx.Tx.Put(k, info.RawSchema); err != nil {
 		return errors.Wrap(err, "failed to write struct presence")
 	}
 
+sameSchema:
 	var err error
 
 	for _, field := range info.Fields {

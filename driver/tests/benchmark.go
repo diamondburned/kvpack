@@ -66,13 +66,15 @@ func (ber Benchmarker) BenchmarkPutKVPack(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	ber.mustTx(b, false, func(tx *kvpack.Transaction) error {
-		for i := 0; i < b.N; i++ {
-			if err := tx.Put(k, &v); err != nil {
-				return errors.Wrap(err, "failed to put")
+	b.RunParallel(func(pb *testing.PB) {
+		ber.mustTx(b, false, func(tx *kvpack.Transaction) error {
+			for pb.Next() {
+				if err := tx.Put(k, &v); err != nil {
+					return errors.Wrap(err, "failed to put")
+				}
 			}
-		}
-		return nil
+			return nil
+		})
 	})
 }
 
@@ -83,17 +85,19 @@ func (ber Benchmarker) BenchmarkPutJSON(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	ber.mustTx(b, false, func(tx *kvpack.Transaction) error {
-		for i := 0; i < b.N; i++ {
-			j, err := json.Marshal(v)
-			if err != nil {
-				return errors.Wrap(err, "failed to encode")
+	b.RunParallel(func(pb *testing.PB) {
+		ber.mustTx(b, false, func(tx *kvpack.Transaction) error {
+			for pb.Next() {
+				j, err := json.Marshal(v)
+				if err != nil {
+					return errors.Wrap(err, "failed to encode")
+				}
+				if err := tx.Put(k, &j); err != nil {
+					return errors.Wrap(err, "failed to put")
+				}
 			}
-			if err := tx.Put(k, &j); err != nil {
-				return errors.Wrap(err, "failed to put")
-			}
-		}
-		return nil
+			return nil
+		})
 	})
 }
 
@@ -110,13 +114,15 @@ func (ber Benchmarker) BenchmarkGetKVPack(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	ber.mustTx(b, true, func(tx *kvpack.Transaction) error {
-		for i := 0; i < b.N; i++ {
-			if err := tx.Get(k, &into); err != nil {
-				return errors.Wrap(err, "failed to get")
+	b.RunParallel(func(pb *testing.PB) {
+		ber.mustTx(b, true, func(tx *kvpack.Transaction) error {
+			for pb.Next() {
+				if err := tx.Get(k, &into); err != nil {
+					return errors.Wrap(err, "failed to get")
+				}
 			}
-		}
-		return nil
+			return nil
+		})
 	})
 }
 
@@ -138,15 +144,17 @@ func (ber Benchmarker) BenchmarkGetJSON(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	ber.mustTx(b, true, func(tx *kvpack.Transaction) error {
-		for i := 0; i < b.N; i++ {
-			if err := tx.Get(k, &output); err != nil {
-				return errors.Wrap(err, "failed to get")
+	b.RunParallel(func(pb *testing.PB) {
+		ber.mustTx(b, true, func(tx *kvpack.Transaction) error {
+			for pb.Next() {
+				if err := tx.Get(k, &output); err != nil {
+					return errors.Wrap(err, "failed to get")
+				}
+				if err := json.Unmarshal(output, &v); err != nil {
+					return errors.Wrap(err, "failed to decode")
+				}
 			}
-			if err := json.Unmarshal(output, &v); err != nil {
-				return errors.Wrap(err, "failed to decode")
-			}
-		}
-		return nil
+			return nil
+		})
 	})
 }
