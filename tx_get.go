@@ -82,7 +82,7 @@ func (tx *Transaction) get(k []byte, v interface{}) error {
 		defer preloader.Unload(k)
 	}
 
-	return tx.getValue(k, typ, typ.Kind(), ptr, 0)
+	return tx.getValue(k, nil, typ, typ.Kind(), ptr, 0)
 }
 
 func (tx *Transaction) keyIterator() driver.KeyIterator {
@@ -129,7 +129,7 @@ func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) 
 		return ErrValueNeedsPtr
 	}
 
-	onEach := func(k []byte) error {
+	onEach := func(k, v []byte) error {
 		fieldKey := bytes.TrimPrefix(k, key)
 		// Ensure that this is the key we expect by verifying that it only has
 		// one part.
@@ -146,7 +146,7 @@ func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) 
 		// Wipe the underlying value before we write to it.
 		defract.ZeroOut(ptr, typ.Size())
 
-		if err := tx.getValue(k, typ, typ.Kind(), ptr, 1); err != nil {
+		if err := tx.getValue(k, v, typ, typ.Kind(), ptr, 1); err != nil {
 			return err
 		}
 
@@ -159,9 +159,9 @@ func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) 
 
 	var err error
 	if it := tx.keyIterator(); it != nil {
-		err = it.IterateKey(key, onEach)
+		err = it.IterateKey(key, func(k []byte) error { return onEach(k, nil) })
 	} else {
-		err = tx.Tx.Iterate(key, func(k, _ []byte) error { return onEach(k) })
+		err = tx.Tx.Iterate(key, onEach)
 	}
 
 	if err != nil && errors.Is(err, internEachBreak) {
@@ -172,25 +172,23 @@ func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) 
 }
 
 func (tx *Transaction) getValue(
-	k []byte, typ reflect.Type, kind reflect.Kind, ptr unsafe.Pointer, rec int) error {
+	k, b []byte, typ reflect.Type, kind reflect.Kind, ptr unsafe.Pointer, rec int) error {
 
 	if rec > recursionLimit {
 		return ErrTooRecursed
 	}
 
-	b, err := tx.Tx.Get(k)
-	if err != nil {
-		if errors.Is(err, driver.ErrKeyNotFound) {
-			return ErrKeyNotFound
+	if b == nil {
+		var err error
+
+		b, err = tx.Tx.Get(k)
+		if err != nil {
+			if errors.Is(err, driver.ErrKeyNotFound) {
+				return ErrKeyNotFound
+			}
+			return err
 		}
-		return err
 	}
-
-	return tx.getValueBytes(k, b, typ, kind, ptr, rec)
-}
-
-func (tx *Transaction) getValueBytes(
-	k, b []byte, typ reflect.Type, kind reflect.Kind, ptr unsafe.Pointer, rec int) error {
 
 	if kind == reflect.Ptr {
 		typ, ptr = defract.AllocIndirect(typ, ptr)
@@ -303,7 +301,7 @@ func (tx *Transaction) getSlice(
 		}
 
 		elemPtr := unsafe.Add(dataPtr, int64(valueSize)*i)
-		return tx.getValueBytes(k, v, underlying, valueKind, elemPtr, rec+1)
+		return tx.getValue(k, v, underlying, valueKind, elemPtr, rec+1)
 	})
 }
 
@@ -326,7 +324,7 @@ func (tx *Transaction) getStruct(
 			return errors.Wrapf(err, "failed to get value for struct field key %q", key)
 		}
 
-		if err := tx.getValueBytes(key, b, field.Type, field.Kind, ptr, rec+1); err != nil {
+		if err := tx.getValue(key, b, field.Type, field.Kind, ptr, rec+1); err != nil {
 			return errors.Wrapf(err, "struct %s field %s", info.Type, field.Name)
 		}
 	}

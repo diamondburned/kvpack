@@ -87,7 +87,8 @@ type animals struct {
 	SoUntrue bool   // ^^^^^^^^^^^^^^^^^^^^^^
 	Numbers  numbers
 	More     *animals
-	NoMore   *animals // nil
+	NoMore   *animals  // nil
+	NoNoMore **animals `deep:"-"` // parsed as completely nil, so ignore
 	Quirks   *quirks
 	Strings  []string
 	Bytes    []byte
@@ -126,7 +127,8 @@ func newTestValue() animals {
 			Cats: "nya nya",
 			Dogs: "wan wan",
 		},
-		NoMore: nil,
+		NoMore:   nil,
+		NoNoMore: new(*animals), // pointer to nil ptr
 		Quirks: &quirks{
 			BoolPtr:   new(bool),
 			StructPtr: new(struct{}),
@@ -266,6 +268,13 @@ func (s suite) testGet(t *testing.T) {
 	accessAssert("put_ptr_1", &gotValue1, &expect)
 	var gotValue2 animals
 	accessAssert("put_ptr_2", &gotValue2, &expect)
+
+	// Ensure these fields are nil, since deep.Equal skips them.
+	for _, animal := range []*animals{&gotValue1, &gotValue2} {
+		if animal.NoNoMore != nil {
+			t.Error("unexpected animal.NoNoMore != nil")
+		}
+	}
 
 	var gotMoreNums1 numbers
 	accessAssert("put_ptr_1.Numbers", &gotMoreNums1, &expect.Numbers)
