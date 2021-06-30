@@ -155,6 +155,11 @@ func (s suite) testPutPtr(t *testing.T) {
 		t.Error("failed to put &testValue using db.Update:", err)
 	}
 	s.testExpect(t, "put_ptr_2")
+
+	testStr := "Hello, world"
+	if err := s.db.Put([]byte("put_str"), &testStr); err != nil {
+		t.Error("failed to put str ptr:", err)
+	}
 }
 
 func (s suite) testPutValue(t *testing.T) {
@@ -291,6 +296,10 @@ func (s suite) testGet(t *testing.T) {
 	accessAssert("put_ptr_1.Cats", &catOutput3, toBytesPtr(expect.Cats))
 	var catOutput4 []byte
 	accessAssert("put_ptr_2.Cats", &catOutput4, toBytesPtr(expect.Cats))
+
+	var gotStr string
+	expectStr := "Hello, world"
+	accessAssert("put_str", &gotStr, &expectStr)
 }
 
 // dummyTestType is a made-up new type to ensure that things are cleaned up
