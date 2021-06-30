@@ -84,6 +84,7 @@ func (tx *Tx) NamespaceBucket() *bbolt.Bucket {
 	return tx.bucket
 }
 
+/*
 // ChildKey loads recursively buckets from the given database key. The tail
 // key is returned, which is the key that should be used to access inside the
 // bucket.
@@ -166,6 +167,7 @@ func (tx *Tx) childBucket(k []byte, create, btail bool) (*bbolt.Bucket, []byte, 
 
 	return root, tail, nil
 }
+*/
 
 // Commit commits the current transaction. Calling Commit multiple times does
 // nothing and will return nil.
@@ -190,14 +192,7 @@ func (tx *Tx) Rollback() error {
 
 // Get gets the value with the given key.
 func (tx *Tx) Get(k []byte) ([]byte, error) {
-	// log.Printf("get([]byte(%q))", k)
-
-	bucket, k, err := tx.ChildKey(k)
-	if err != nil {
-		return nil, err
-	}
-
-	v := bucket.Get(k)
+	v := tx.bucket.Get(k)
 	if v == nil {
 		return nil, driver.ErrKeyNotFound
 	}
@@ -207,60 +202,33 @@ func (tx *Tx) Get(k []byte) ([]byte, error) {
 
 // Put puts the given value into the given key.
 func (tx *Tx) Put(k, v []byte) error {
-	// log.Printf("put([]byte(%q))", k)
-
-	bucket, k, err := tx.CreateChildKey(k)
-	if err != nil {
-		return err
-	}
-
-	return bucket.Put(k, v)
+	return tx.bucket.Put(k, v)
 }
 
 // DeletePrefix deletes all keys with the given prefix.
 func (tx *Tx) DeletePrefix(prefix []byte) error {
-	bucket, k, err := tx.ChildKey(prefix)
-	if err != nil {
-		return nil
-	}
+	cursor := tx.bucket.Cursor()
 
-	// Ensure the bucket is deleted.
-	if err := bucket.DeleteBucket(bytes.TrimSuffix(k, []byte("\x00"))); err != nil {
-		if !errors.Is(err, bbolt.ErrBucketNotFound) {
-			return err
+	for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+		if bytes.HasPrefix(k, prefix) {
+			if err := cursor.Delete(); err != nil {
+				return errors.Wrapf(err, "failed to delete key %q", k)
+			}
 		}
-
-		// No bucket found; delete key instead.
-		return bucket.Delete(k)
-	} else {
-		return nil
 	}
+
+	return nil
 }
 
 // Iterate iterates over all keys with the given prefix in lexicographic order.
 func (tx *Tx) Iterate(prefix []byte, fn func(k, v []byte) error) error {
-	// Access the bucket, but trim the trailing separator, because we're
-	// expecting all parts to be bucket names.
-	bucket, err := tx.ChildBucket(prefix[:len(prefix)-len(kvpack.Separator)])
-	if err != nil {
-		return err
-	}
-
-	cursor := bucket.Cursor()
-
-	buffer := make([]byte, len(prefix), len(prefix)+512)
-	copy(buffer, prefix)
+	cursor := tx.bucket.Cursor()
 
 	for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-		if v == nil {
-			continue
-		}
-
-		fullKey := append(buffer, bytes.TrimSuffix(k, []byte("\x00"))...)
-		buffer = fullKey[:len(buffer)]
-
-		if err := fn(fullKey, v); err != nil {
-			return err
+		if bytes.HasPrefix(k, prefix) {
+			if err := fn(k, v); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -273,7 +241,6 @@ func (tx *Tx) Iterate(prefix []byte, fn func(k, v []byte) error) error {
 // issue.
 
 /*
-BenchmarkGetKVPack
 2021/06/29 16:08:33 panicking at key "__kvpack\x00get_kvpack\x00benchmark_get_kvpack\x00OtherCharacters\x001\x00CharacterScore"
 2021/06/29 16:08:33 panicking at key "__kvpack\x00get_kvpack\x00benchmark_get_kvpack\x00OtherCharacters"
 panic: runtime error: index out of range [2599146904983207936] with length 281474976710655 [recovered]
