@@ -1,5 +1,6 @@
 # kvpack
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/diamondburned/kvpack#Database.Each.svg)](https://pkg.go.dev/github.com/diamondburned/kvpack#Database.Each)
 [![pipeline status](https://gitlab.com/diamondburned/kvpack/badges/unsafe-footgun/pipeline.svg)](https://gitlab.com/diamondburned/kvpack/-/commits/unsafe-footgun)
 [![coverage report](https://gitlab.com/diamondburned/kvpack/badges/unsafe-footgun/coverage.svg)](https://gitlab.com/diamondburned/kvpack/-/commits/unsafe-footgun)
 
