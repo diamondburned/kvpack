@@ -97,10 +97,12 @@ func (tx *Transaction) keyIterator() driver.KeyIterator {
 var internEachBreak = errors.New("break each")
 
 // Each iterates over each instance of the given dot-syntax fields key and calls
-// the eachFn callback on each iteration. The callback must capture the pointer
-// passed in, and it must not move or take any of the fields inside the given
-// value until Each exits. The callback must also not take the given key away;
-// it has to copy it into a new slice.
+// the eachFn callback on each iteration. If fields is empty, then the current
+// namespace is iterated over.
+//
+// The callback must capture the pointer passed in, and it must not move or take
+// any of the fields inside the given value until Each exits. The callback must
+// also not take the given key away; it has to copy it into a new slice.
 //
 // The order of iteration is undefined and unguaranteed by kvpack, however, that
 // is entirely up to the driver and its order of iteration. Refer to the

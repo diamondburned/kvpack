@@ -18,8 +18,8 @@ type Database struct {
 
 // NewDatabase makes a new empty database. If a namespace is provided, then
 // Expect will use that namespace.
-func NewDatabase(expectNamespace string) *kvpack.Database {
-	return kvpack.NewDatabase(newDatabase(), expectNamespace)
+func NewDatabase(namespace string) *kvpack.Database {
+	return kvpack.NewDatabase(newDatabase()).WithNamespace(namespace)
 }
 
 func newDatabase() *Database {
@@ -33,7 +33,7 @@ var kvPairPool = sync.Pool{
 }
 
 // Begin starts a transaction.
-func (db *Database) Begin(ro bool) (driver.Transaction, error) {
+func (db *Database) Begin(_ []byte, ro bool) (driver.Transaction, error) {
 	if ro {
 		return &Transaction{db: db}, nil
 	}

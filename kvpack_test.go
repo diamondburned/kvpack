@@ -48,7 +48,7 @@ func TestNilParams(t *testing.T) {
 		"a\x00other":      "a",
 		"a\x00other\x002": "b",
 	}}
-	tx := NewTransaction(mn, "a", false)
+	tx := NewTransaction(mn, []byte("a"), false)
 
 	if err := tx.Put([]byte("key"), nil); !errors.Is(err, ErrValueNeedsPtr) {
 		t.Fatal("unexpected error putting nil value:", err)
@@ -70,7 +70,7 @@ func TestNilParams(t *testing.T) {
 
 func TestRO(t *testing.T) {
 	db := miniTx{make(map[string]string)}
-	tx := NewTransaction(db, "", true)
+	tx := NewTransaction(db, nil, true)
 
 	mustErrIs(t, tx.Put([]byte("a"), []byte("b")), ErrReadOnly.Error())
 	if len(db.v) > 0 {

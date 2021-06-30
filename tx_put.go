@@ -12,8 +12,8 @@ import (
 	"github.com/pkg/errors"
 )
 
-// PutFields puts the given value into the databse ID'd by the given keys
-// (plural). This function is similar to GetFields, except it's Put.
+// PutFields puts the given value into the databse ID'd by the given dot-syntax
+// fields key. This function is similar to GetFields, except it's Put.
 func (tx *Transaction) PutFields(fields string, v interface{}) error {
 	if tx.ro {
 		return ErrReadOnly

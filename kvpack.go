@@ -2,6 +2,7 @@ package kvpack
 
 import (
 	"io"
+	"strings"
 
 	"github.com/diamondburned/kvpack/driver"
 	"github.com/diamondburned/kvpack/internal/key"
@@ -51,14 +52,15 @@ type Transaction struct {
 }
 
 // NewTransaction creates a new transaction from an existing one. This is useful
-// for working around Database's limited APIs.
-func NewTransaction(tx driver.Transaction, namespace string, ro bool) *Transaction {
+// for working around Database's limited APIs. Users shouldn't call this
+// directly, as this function is primarily used for drivers.
+func NewTransaction(tx driver.Transaction, fullNamespace []byte, ro bool) *Transaction {
 	kb := key.TakeArena(Separator)
-	kb.Buffer = append(kb.Buffer, namespace...)
+	kb.Buffer = append(kb.Buffer, fullNamespace...)
 
 	return &Transaction{
 		Tx: tx,
-		ns: len(namespace),
+		ns: len(fullNamespace),
 		kb: kb,
 		ro: ro,
 	}
@@ -110,6 +112,11 @@ func (tx *Transaction) DeleteFields(fields string) error {
 }
 
 func (tx *Transaction) makeFieldsKey(fields string) []byte {
+	// Special case: if fields is empty, then use the current root namespace.
+	if fields == "" {
+		return tx.namespace()
+	}
+
 	key := tx.kb.Append(tx.namespace(), []byte(fields))
 	// Replace all periods with the right separator.
 	for i := len(tx.namespace()); i < len(key); i++ {
@@ -132,16 +139,16 @@ func (tx *Transaction) namespace() []byte {
 // use concurrently.
 type Database struct {
 	driver.Database
-	namespace string
+	namespace []byte
 }
 
 // NewDatabase creates a new database from an existing database instance. The
-// given namespace will be prepended into the keys of all transactions. This is
-// useful for separating database instances.
-func NewDatabase(db driver.Database, namespace string) *Database {
+// default namespace is the root namespace; most users should follow this call
+// with .WithNamespace().
+func NewDatabase(db driver.Database) *Database {
 	return &Database{
 		Database:  db,
-		namespace: Namespace + Separator + namespace,
+		namespace: []byte(Namespace), // root namespace
 	}
 }
 
@@ -154,15 +161,43 @@ func (db *Database) Close() error {
 	return nil
 }
 
+// Descend returns a new database that has been moved into the children
+// namespaces of the previous namespace. For example, if "app-name" is the
+// string passed into WithNamespace, then calling Descend("users") will give
+// "app-name.users" in dot-syntax.
+func (db *Database) Descend(namespaces ...string) *Database {
+	cpy := *db
+	cpy.namespace = append(cpy.namespace, Separator...)
+	cpy.namespace = append(cpy.namespace, strings.Join(namespaces, Separator)...)
+	return &cpy
+}
+
+// WithNamespace creates a new database instance from the existing one with a
+// different namespace. If multiple namespaces are given, then it is treated as
+// nested field keys. Because of this, the meaning of how nested the fields are
+// is entirely up to the user.
+func (db *Database) WithNamespace(namespaces ...string) *Database {
+	cpy := *db
+
+	if len(namespaces) > 0 {
+		cpy.namespace = []byte(Namespace + Separator + strings.Join(namespaces, Separator))
+	} else {
+		cpy.namespace = []byte(Namespace)
+	}
+
+	return &cpy
+}
+
 // Namespace returns the database's namespace, which is the prefix that is
-// always prepended into keys.
+// always prepended into keys. The returned namespace string is raw, meaning it
+// is not dot-syntax.
 func (db *Database) Namespace() string {
-	return db.namespace
+	return string(db.namespace)
 }
 
 // Begin starts a transaction.
 func (db *Database) Begin(readOnly bool) (*Transaction, error) {
-	tx, err := db.Database.Begin(readOnly)
+	tx, err := db.Database.Begin(db.namespace, readOnly)
 	if err != nil {
 		return nil, err
 	}

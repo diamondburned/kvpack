@@ -16,16 +16,17 @@ type DB badger.DB
 
 // Open opens a new Badger database wrapped inside a driver.Database-compatible
 // implementation.
-func Open(namespace string, opts badger.Options) (*kvpack.Database, error) {
+func Open(opts badger.Options) (*kvpack.Database, error) {
 	d, err := badger.Open(opts)
 	if err != nil {
 		return nil, err
 	}
-	return kvpack.NewDatabase((*DB)(d), namespace), nil
+	return kvpack.NewDatabase((*DB)(d)), nil
 }
 
-// Begin starts a transaction.
-func (db *DB) Begin(ro bool) (driver.Transaction, error) {
+// Begin starts a transaction. The namespace is ignored, because the keys
+// already includes the namespace.
+func (db *DB) Begin(_ []byte, ro bool) (driver.Transaction, error) {
 	txn := (*badger.DB)(db).NewTransaction(!ro)
 	return &Txn{
 		Txn:       txn,

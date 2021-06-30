@@ -6,7 +6,10 @@ import "errors"
 
 // Database describes a generic transactional key-value database.
 type Database interface {
-	Begin(readOnly bool) (Transaction, error)
+	// Begin starts a transaction for the given namespace. The given namespace
+	// will always be prepended into the given keys of the transaction, so the
+	// driver can trim the namespace away.
+	Begin(namespace []byte, readOnly bool) (Transaction, error)
 }
 
 // ErrKeyNotFound is returned if a key is not found.

@@ -20,13 +20,13 @@ func mustOpen(tb testing.TB, namespace string) *kvpack.Database {
 		FreelistType: bbolt.FreelistArrayType,
 	}
 
-	d, err := Open(namespace, filepath.Join(temp, namespace), os.ModePerm, opts)
+	d, err := Open(filepath.Join(temp, namespace), os.ModePerm, opts)
 	if err != nil {
 		tb.Fatal("failed to open in-memory badgerDB:", err)
 	}
 	tb.Cleanup(func() { d.Close() })
 
-	return d
+	return d.WithNamespace(namespace)
 }
 
 func TestSuite(t *testing.T) {

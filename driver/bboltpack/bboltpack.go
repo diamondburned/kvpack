@@ -12,66 +12,63 @@ import (
 )
 
 // DB implements driver.Database.
-type DB struct {
-	*bbolt.DB
-	namespace []byte
-}
+type DB bbolt.DB
 
 // Open opens a new Badger database wrapped inside a driver.Database-compatible
 // implementation.
-func Open(namespace, path string, mode os.FileMode, opts *bbolt.Options) (*kvpack.Database, error) {
+func Open(path string, mode os.FileMode, opts *bbolt.Options) (*kvpack.Database, error) {
 	d, err := bbolt.Open(path, mode, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	db := DB{d, nil}
-	kvdb := kvpack.NewDatabase(&db, namespace)
-	db.namespace = []byte(kvdb.Namespace())
-
 	if err := d.Update(func(tx *bbolt.Tx) error {
-		// Create our own bucket.
-		_, err = tx.CreateBucketIfNotExists(db.namespace)
-		if err != nil {
-			return errors.Wrap(err, "failed to create namespace bucket")
-		}
 
 		return nil
 	}); err != nil {
 		return nil, err
 	}
 
-	return kvdb, nil
+	return kvpack.NewDatabase((*DB)(d)), nil
 }
 
 // Close closes the database.
 func (db *DB) Close() error {
-	return db.DB.Close()
+	return (*bbolt.DB)(db).Close()
 }
 
 // Begin starts a transaction.
-func (db *DB) Begin(ro bool) (driver.Transaction, error) {
-	tx, err := db.DB.Begin(!ro)
+func (db *DB) Begin(namespace []byte, ro bool) (driver.Transaction, error) {
+	tx, err := (*bbolt.DB)(db).Begin(!ro)
 	if err != nil {
 		return nil, err
 	}
 
-	bucket := tx.Bucket(db.namespace)
-	if bucket == nil {
-		tx.Rollback()
-		return nil, errors.New("namespace bucket not found")
+	var b *bbolt.Bucket
+	if !ro {
+		b, err = tx.CreateBucketIfNotExists(namespace)
+		if err != nil {
+			tx.Rollback()
+			return nil, errors.Wrap(err, "failed to create namespace bucket")
+		}
+	} else {
+		b = tx.Bucket(namespace)
 	}
 
 	return &Tx{
-		bucket:    bucket,
-		namespace: len(db.namespace) + 1,
+		bucket: b,
+		tx:     tx,
+
+		namespace: len(namespace) + 1,
 		done:      false,
 	}, nil
 }
 
 // Tx implements driver.Transaction.
 type Tx struct {
-	bucket    *bbolt.Bucket
+	bucket *bbolt.Bucket // can be nil if RO tx
+	tx     *bbolt.Tx
+
 	namespace int
 	done      bool
 }
@@ -79,95 +76,15 @@ type Tx struct {
 var _ driver.Transaction = (*Tx)(nil)
 
 // NamespaceBucket returns the current namespace's bucket inside the
-// transaction.
+// transaction. If the transaction is read-only and no keys have been put
+// before, then nil is returned.
 func (tx *Tx) NamespaceBucket() *bbolt.Bucket {
 	return tx.bucket
 }
 
-/*
-// ChildKey loads recursively buckets from the given database key. The tail
-// key is returned, which is the key that should be used to access inside the
-// bucket.
-func (tx *Tx) ChildKey(k []byte) (*bbolt.Bucket, []byte, error) {
-	return tx.childBucket(k, false, false)
-}
-
-// ChildKey loads recursively buckets from the given database key. The tail of
-// the key is treated as a bucket as well.
-func (tx *Tx) ChildBucket(k []byte) (*bbolt.Bucket, error) {
-	b, _, err := tx.childBucket(k, false, true)
-	return b, err
-}
-
-// CreateChildKey creates recursively buckets from the given database key.
-// The tail key is returned, which is the key that should be used to put inside
-// the bucket.
-func (tx *Tx) CreateChildKey(k []byte) (*bbolt.Bucket, []byte, error) {
-	return tx.childBucket(k, true, false)
-}
-
-func (tx *Tx) childBucket(k []byte, create, btail bool) (*bbolt.Bucket, []byte, error) {
-	if tx.done {
-		return nil, nil, bbolt.ErrTxClosed
-	}
-
-	if len(k) < tx.namespace {
-		return nil, k, driver.ErrKeyNotFound
-	}
-
-	// Trim the namespace prefix, since we're already in that bucket.
-	k = k[tx.namespace:]
-
-	root := tx.bucket
-
-	var descend func(k []byte) (*bbolt.Bucket, error)
-	var err error
-
-	if create {
-		descend = func(k []byte) (*bbolt.Bucket, error) {
-			return root.CreateBucketIfNotExists(k)
-		}
-	} else {
-		descend = func(k []byte) (*bbolt.Bucket, error) {
-			bucket := root.Bucket(k)
-			if bucket == nil {
-				return nil, driver.ErrKeyNotFound
-			}
-			return bucket, nil
-		}
-	}
-
-	for {
-		current := bytes.Index(k, []byte(kvpack.Separator))
-		if current < 0 {
-			break
-		}
-
-		root, err = descend(k[:current])
-		if err != nil {
-			return nil, k, err
-		}
-
-		k = k[current+len(kvpack.Separator):]
-	}
-
-	if btail {
-		root, err = descend(k)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		return root, nil, err
-	}
-
-	// Append a null byte at the end to separate bucket keys and regular keys.
-	tail := make([]byte, len(k)+1)
-	tail[len(k)] = '\x00'
-	copy(tail, k)
-
-	return root, tail, nil
-}
-*/
+// Using recursive buckets might worsen performance by quite a margin, but this
+// has only been tested with small structs, so the performance difference may
+// not be too pronounced.
 
 // Commit commits the current transaction. Calling Commit multiple times does
 // nothing and will return nil.
@@ -177,7 +94,7 @@ func (tx *Tx) Commit() error {
 	}
 
 	tx.done = true
-	return tx.bucket.Tx().Commit()
+	return tx.tx.Commit()
 }
 
 // Rollback discards the current transaction.
@@ -187,11 +104,15 @@ func (tx *Tx) Rollback() error {
 	}
 
 	tx.done = true
-	return tx.bucket.Tx().Rollback()
+	return tx.tx.Rollback()
 }
 
 // Get gets the value with the given key.
 func (tx *Tx) Get(k []byte) ([]byte, error) {
+	if tx.bucket == nil {
+		return nil, driver.ErrKeyNotFound
+	}
+
 	v := tx.bucket.Get(k)
 	if v == nil {
 		return nil, driver.ErrKeyNotFound
@@ -202,11 +123,19 @@ func (tx *Tx) Get(k []byte) ([]byte, error) {
 
 // Put puts the given value into the given key.
 func (tx *Tx) Put(k, v []byte) error {
+	if tx.bucket == nil {
+		return errors.New("Put called on RO transaction")
+	}
+
 	return tx.bucket.Put(k, v)
 }
 
 // DeletePrefix deletes all keys with the given prefix.
 func (tx *Tx) DeletePrefix(prefix []byte) error {
+	if tx.bucket == nil {
+		return errors.New("DeletePrefix called on RO transaction")
+	}
+
 	cursor := tx.bucket.Cursor()
 
 	for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
@@ -222,6 +151,11 @@ func (tx *Tx) DeletePrefix(prefix []byte) error {
 
 // Iterate iterates over all keys with the given prefix in lexicographic order.
 func (tx *Tx) Iterate(prefix []byte, fn func(k, v []byte) error) error {
+	if tx.bucket == nil {
+		// Not having the prefix is not an error, but we don't call fn.
+		return nil
+	}
+
 	cursor := tx.bucket.Cursor()
 
 	for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
