@@ -352,20 +352,8 @@ func TestStructInfo(t *testing.T) {
 				Offset: 5 * unsafe.Sizeof(0),
 			},
 			{
-				Type: reflect.TypeOf(anotherStruct{}),
-				Kind: reflect.Struct,
-				ChildStruct: &StructInfo{
-					Type:      reflect.TypeOf(anotherStruct{}),
-					RawSchema: []byte("Astolfo"),
-					Fields: []StructField{
-						{
-							Type: reflect.TypeOf(""),
-							Kind: reflect.String,
-							Name: []byte("Astolfo"),
-							Size: 2 * unsafe.Sizeof(0),
-						},
-					},
-				},
+				Type:   reflect.TypeOf(anotherStruct{}),
+				Kind:   reflect.Struct,
 				Name:   []byte("Astolfo"),
 				Size:   2 * unsafe.Sizeof(0),
 				Offset: 6 * unsafe.Sizeof(0),

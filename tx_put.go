@@ -201,7 +201,7 @@ func (tx *Transaction) putStruct(
 	// Verify that the struct schema is the same. If not, wipe everything and
 	// rewrite. If it is, then we don't need to scan the database.
 	if v, err := tx.Tx.Get(k); err == nil && bytes.Equal(info.RawSchema, v) {
-		goto sameSchema
+		goto putFieldsLoop
 	}
 
 	// Wipe the entire old map.
@@ -215,9 +215,7 @@ func (tx *Transaction) putStruct(
 		return errors.Wrap(err, "failed to write struct presence")
 	}
 
-sameSchema:
-	var err error
-
+putFieldsLoop:
 	for _, field := range info.Fields {
 		ptr := unsafe.Add(ptr, field.Offset)
 		// Skip zero-values.
@@ -227,19 +225,7 @@ sameSchema:
 
 		key := tx.kb.Append(k, field.Name)
 
-		if field.ChildStruct != nil {
-			if field.Indirect {
-				if ptr = defract.IndirectOnce(ptr); ptr == nil {
-					return nil
-				}
-			}
-			// Field is a struct, use the fast path and skip the map lookup.
-			err = tx.putStruct(key, field.ChildStruct, ptr, rec+1)
-		} else {
-			err = tx.putValue(key, field.Type, field.Kind, ptr, rec+1)
-		}
-
-		if err != nil {
+		if err := tx.putValue(key, field.Type, field.Kind, ptr, rec+1); err != nil {
 			return errors.Wrapf(err, "struct %s field %s", info.Type, field.Name)
 		}
 	}

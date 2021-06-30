@@ -352,12 +352,7 @@ type StructInfo struct {
 }
 
 type StructField struct {
-	Type reflect.Type
-
-	// ChildStruct is provided if this field is of type struct. If the type
-	// matches exactly the parent, then the same pointer is set.
-	ChildStruct *StructInfo
-
+	Type   reflect.Type
 	Name   []byte
 	Kind   reflect.Kind
 	Size   uintptr
@@ -442,25 +437,6 @@ func (info *StructInfo) get(typ reflect.Type) {
 			Offset:   fieldType.Offset,
 			Indirect: fieldType.Type.Kind() == reflect.Ptr,
 		})
-
-		// Access the struct field that we just put in.
-		structField := &info.Fields[len(info.Fields)-1]
-
-		underlyingType := fieldType.Type
-		if structField.Indirect {
-			underlyingType = underlyingType.Elem()
-		}
-
-		if underlyingType.Kind() == reflect.Struct {
-			if underlyingType == typ {
-				// Struct field's type is the same as the one we're
-				// initializing, so use that same pointer.
-				structField.ChildStruct = info
-			} else {
-				// Prefetch the struct information if this one embeds it.
-				structField.ChildStruct = GetStructInfo(underlyingType)
-			}
-		}
 	}
 
 	// Render the raw schema.

@@ -37,6 +37,7 @@ runTest:
 	t.Run("Get", s.testGet)
 	t.Run("Override", s.testOverride)
 	t.Run("Delete", s.testDelete)
+	t.Run("DeleteFields", s.testDeleteFields)
 	t.Run("Each", s.testEach)
 
 	// Run the test twice if we're on a Little-Endian machine.
@@ -353,6 +354,59 @@ func (s suite) testDelete(t *testing.T) {
 	}
 
 	// Check the non-special-case path.
+}
+
+type superNestedStruct struct {
+	Wow struct {
+		Much struct {
+			Nested struct {
+				Such struct {
+					Wow string
+				}
+			}
+		}
+	}
+}
+
+func (s suite) testDeleteFields(t *testing.T) {
+	var nested superNestedStruct
+	nested.Wow.Much.Nested.Such.Wow = "doge meme"
+
+	if err := s.db.Put([]byte("deletefields_testkey"), &nested); err != nil {
+		t.Fatal("failed to put:", err)
+	}
+
+	var out superNestedStruct
+	if err := s.db.Get([]byte("deletefields_testkey"), &out); err != nil {
+		t.Fatal("failed to get what's put:", err)
+	}
+
+	if nested != out {
+		t.Fatalf("unexpected output: %#v", out)
+	}
+
+	// Delete the deeply nested field. Since this was the only field that didn't
+	// have a non-zero-value, deleting this field will effectively clean up the
+	// whole struct in the database. This is assuming the database is
+	// implemented as a flat key-value store, however. If it's not, then Get
+	// will return a nil error without filling up the value. We have to account
+	// for both cases.
+	if err := s.db.DeleteFields("deletefields_testkey.Wow.Much.Nested.Such"); err != nil {
+		t.Fatal("failed to delete:", err)
+	}
+
+	out = superNestedStruct{} // reset
+	if err := s.db.Get([]byte("deletefields_testkey"), &out); err == nil {
+		// Case 1: if the database is not implemented as a flat key-value store.
+		if out.Wow.Much.Nested.Such.Wow != "" {
+			t.Fatalf("value remains in output: %#v", out)
+		}
+	} else {
+		// Case 2: if the database is implemented as a flat key-value store.
+		if !errors.Is(err, kvpack.ErrKeyNotFound) {
+			t.Fatal("unexpected error getting deleted key:", err)
+		}
+	}
 }
 
 // makeKey makes a full key from the given two parts.
