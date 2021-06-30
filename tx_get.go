@@ -94,7 +94,9 @@ func (tx *Transaction) keyIterator() driver.KeyIterator {
 	return tx.lazy.keyIterator
 }
 
-var internEachBreak = errors.New("break each")
+// Break is returned from Each's callback when the callback is done and can
+// break gracefully.
+var Break = errors.New("break each")
 
 // Each iterates over each instance of the given dot-syntax fields key and calls
 // the eachFn callback on each iteration. If fields is empty, then the current
@@ -102,7 +104,9 @@ var internEachBreak = errors.New("break each")
 //
 // The callback must capture the pointer passed in, and it must not move or take
 // any of the fields inside the given value until Each exits. The callback must
-// also not take the given key away; it has to copy it into a new slice.
+// also not take the given key away; it has to copy it into a new slice. If the
+// callback returns kvpack.Break, then a nil error is returned. Otherwise, the
+// error is passed over.
 //
 // The order of iteration is undefined and unguaranteed by kvpack, however, that
 // is entirely up to the driver and its order of iteration. Refer to the
@@ -121,7 +125,7 @@ var internEachBreak = errors.New("break each")
 //        return user.Name == "need this user"
 //    })
 //
-func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) (done bool)) error {
+func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) error) error {
 	var key []byte
 	key = tx.makeFieldsKey(fields)
 	key = tx.kb.Append(key, nil) // ensure trailing separator
@@ -152,8 +156,8 @@ func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) 
 			return err
 		}
 
-		if eachFn(fieldKey) {
-			return internEachBreak
+		if err := eachFn(fieldKey); err != nil {
+			return err
 		}
 
 		return nil
@@ -166,7 +170,7 @@ func (tx *Transaction) Each(fields string, v interface{}, eachFn func(k []byte) 
 		err = tx.Tx.Iterate(key, onEach)
 	}
 
-	if err != nil && errors.Is(err, internEachBreak) {
+	if err != nil && errors.Is(err, Break) {
 		return nil
 	}
 

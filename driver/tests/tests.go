@@ -521,11 +521,11 @@ func (s suite) testEach(t *testing.T) {
 	}
 
 	var dst extinct
-	err := s.db.Each("each.extincts", &dst, func(k []byte) (br bool) {
+	err := s.db.Each("each.extincts", &dst, func(k []byte) error {
 		expect, ok := expects[string(k)]
 		if !ok {
 			t.Fatalf("unexpected Each key %q", k)
-			return true
+			return kvpack.Break
 		}
 
 		if expect != dst {
@@ -534,7 +534,7 @@ func (s suite) testEach(t *testing.T) {
 				"got      %#v", expect, dst)
 		}
 
-		return false
+		return nil
 	})
 
 	if err != nil {

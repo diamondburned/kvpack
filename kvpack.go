@@ -272,7 +272,7 @@ func (db *Database) Get(k []byte, v interface{}) error {
 
 // Each iterates over the dot-syntax fields key from the database in a single
 // transaction. Refer to Transaction's Each for more documentation.
-func (db *Database) Each(fields string, v interface{}, eachFn func(k []byte) (done bool)) error {
+func (db *Database) Each(fields string, v interface{}, eachFn func(k []byte) error) error {
 	tx, err := db.Begin(true)
 	if err != nil {
 		return errors.Wrap(err, "failed to start transaction")
