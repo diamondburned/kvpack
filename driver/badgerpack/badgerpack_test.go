@@ -14,6 +14,7 @@ func mustOpenInMemory(tb testing.TB, namespace string) *kvpack.Database {
 	opts.Logger = nil
 	opts.InMemory = true
 	opts.Compression = options.None
+	opts.DetectConflicts = false
 
 	d, err := Open(namespace, opts)
 	if err != nil {

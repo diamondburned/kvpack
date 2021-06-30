@@ -66,16 +66,14 @@ func (ber Benchmarker) BenchmarkPutKVPack(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	b.RunParallel(func(pb *testing.PB) {
+	for i := 0; i < b.N; i++ {
 		ber.mustTx(b, false, func(tx *kvpack.Transaction) error {
-			for pb.Next() {
-				if err := tx.Put(k, &v); err != nil {
-					return errors.Wrap(err, "failed to put")
-				}
+			if err := tx.Put(k, &v); err != nil {
+				return errors.Wrap(err, "failed to put")
 			}
 			return nil
 		})
-	})
+	}
 }
 
 func (ber Benchmarker) BenchmarkPutJSON(b *testing.B) {
@@ -85,20 +83,18 @@ func (ber Benchmarker) BenchmarkPutJSON(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	b.RunParallel(func(pb *testing.PB) {
+	for i := 0; i < b.N; i++ {
 		ber.mustTx(b, false, func(tx *kvpack.Transaction) error {
-			for pb.Next() {
-				j, err := json.Marshal(v)
-				if err != nil {
-					return errors.Wrap(err, "failed to encode")
-				}
-				if err := tx.Put(k, &j); err != nil {
-					return errors.Wrap(err, "failed to put")
-				}
+			j, err := json.Marshal(v)
+			if err != nil {
+				return errors.Wrap(err, "failed to encode")
+			}
+			if err := tx.Put(k, &j); err != nil {
+				return errors.Wrap(err, "failed to put")
 			}
 			return nil
 		})
-	})
+	}
 }
 
 func (ber Benchmarker) BenchmarkGetKVPack(b *testing.B) {

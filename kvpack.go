@@ -175,7 +175,7 @@ func (db *Database) Begin(readOnly bool) (*Transaction, error) {
 func (db *Database) View(f func(*Transaction) error) error {
 	tx, err := db.Begin(true)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to start transaction")
 	}
 
 	if err := f(tx); err != nil {
@@ -191,7 +191,7 @@ func (db *Database) View(f func(*Transaction) error) error {
 func (db *Database) Update(f func(*Transaction) error) error {
 	tx, err := db.Begin(false)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to start transaction")
 	}
 
 	if err := f(tx); err != nil {
