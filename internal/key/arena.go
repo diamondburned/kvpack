@@ -14,7 +14,10 @@ var (
 // stockKeyPoolCap sets the capacity for each new key buffer. This sets the
 // threshold for when appendExtra should just allocate a new slice instead of
 // taking one from the pool.
-const stockKeyPoolCap = 512 * 1024 // 512KB
+//
+// 32KB is picked, because Go's allocator has a specific size class for that:
+// https://github.com/golang/go/blob/master/src/runtime/sizeclasses.go
+const stockKeyPoolCap = 32768
 
 // Arena describes a buffer where keys are appended into a single, reusable
 // buffer.
@@ -113,16 +116,12 @@ func (kb *Arena) AppendExtra(head, tail []byte, extra int) (newBuf, extraBuf []b
 		end += copy(new[end:], tail)
 
 		// The new slice has the exact length needed minus the extra.
-		newBuf = new[:end:end]
+		newBuf = new[:end]
 
 		// Kill the GC. Create a new keyBuffer entry with the "previous" field
 		// pointing to the current one, then set the current one to the new one.
 		old := kb.keyBuffer
 		kb.keyBuffer = &keyBuffer{Buffer: new, prev: old}
-
-		if extra > 0 {
-			extraBuf = new[end : end+extra]
-		}
 
 	} else {
 		// Set newBuf to the tail of the backing array.
@@ -134,22 +133,22 @@ func (kb *Arena) AppendExtra(head, tail []byte, extra int) (newBuf, extraBuf []b
 
 		// Slice the original slice to include the new section without the extra
 		// part.
-		newBuf = kb.Buffer[start:len(kb.Buffer):len(kb.Buffer)]
+		newBuf = kb.Buffer[start:]
 
 		if extra > 0 {
-			extraEnd := len(kb.Buffer) + extra
-			extraBuf = kb.Buffer[len(kb.Buffer):extraEnd:extraEnd]
-
 			// Include the extra allocated parts into the main buffer so the
 			// next call doesn't override it.
-			kb.Buffer = kb.Buffer[:extraEnd]
+			kb.Buffer = kb.Buffer[:len(kb.Buffer)+extra]
 		}
 	}
 
-	if extraBuf != nil {
-		// Ensure the extra buffer is always zeroed out.
-		defract.ZeroOutBytes(extraBuf)
+	if extra == 0 {
+		return newBuf, nil
 	}
 
-	return
+	extraBuf = newBuf[len(newBuf) : len(newBuf)+extra]
+	// Ensure the extra buffer is always zeroed out.
+	defract.ZeroOutBytes(extraBuf)
+
+	return newBuf, extraBuf
 }
