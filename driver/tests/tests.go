@@ -90,6 +90,7 @@ type animals struct {
 	NoMore   *animals // nil
 	Quirks   *quirks
 	Strings  []string
+	Bytes    []byte
 	MoreNums []int
 	junk     string `deep:"-"` // unexpected so ignore
 }
@@ -132,6 +133,7 @@ func newTestValue() animals {
 			StringPtr: new(string),
 		},
 		Strings:  []string{"Astolfo", "Felix", "idk lol"},
+		Bytes:    []byte("<3Astolfo"),
 		MoreNums: []int{1, 2, 3, 4, 2, 0, 6, 9, 10},
 		junk:     "ignore me",
 	}
@@ -223,6 +225,8 @@ func (s suite) testExpect(t *testing.T, key string) {
 		"Strings.0": "Astolfo",
 		"Strings.1": "Felix",
 		"Strings.2": "idk lol",
+
+		"Bytes": "<3Astolfo",
 
 		"MoreNums":   n(int64(9)),
 		"MoreNums.0": n(int(1)),
